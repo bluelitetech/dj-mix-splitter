@@ -5,8 +5,8 @@ trackid.py - build a timestamped tracklist for a DJ mix on YouTube (or a local a
 How it works
   1. Reads the video's title/description/chapters with yt-dlp and pulls out any
      tracklist the uploader posted (with or without timestamps).
-  2. Downloads the audio, cuts a short clip every --step seconds, and asks Shazam
-     what each clip is.
+  2. Downloads the audio and asks Shazam what short clips of it are: a quick pass
+     first, then closer listening where songs change or are still missing.
   3. Merges the hits into tracks with start times (using Shazam's offset to work out
      where each song actually began in the mix).
   4. If a posted tracklist exists, matches the hits against it: posted tracks get
@@ -26,6 +26,7 @@ import argparse
 import asyncio
 import csv
 import json
+import math
 import os
 import re
 import shutil
@@ -244,23 +245,92 @@ def save_scan_cache(path, clip_len, clips):
     os.replace(tmp, path)
 
 
-async def scan(audio, duration, step, clip_len, concurrency, cache_path=None):
-    """Ask Shazam about one clip every `step` seconds. With cache_path, answers are saved as they arrive, so a
-    retry after a crash/restart only asks about the clips that are still missing."""
+REFINE_TO = 8      # stop pinning down a song's start once it's known to within this many seconds
+REFINE_ROUNDS = 5  # each round narrows the gap (roughly halves it), so 60s -> 30 -> 15 -> 7.5 with room to spare
+
+
+def match_known(songs, known, threshold=0.6):
+    """Pair each heard song with the best unused posted track. Returns one posted index (or None) per song."""
+    used, out = set(), []
+    for s in songs:
+        best, best_i = 0.0, None
+        for i, k in enumerate(known):
+            if i in used:
+                continue
+            sc = title_similarity(k, s)
+            if sc > best:
+                best, best_i = sc, i
+        if best_i is not None and best >= threshold:
+            used.add(best_i)
+            out.append(best_i)
+        else:
+            out.append(None)
+    return out
+
+
+def missing_known(heard, known):
+    """How many posted tracks none of the heard songs matches."""
+    songs = list({h["key"]: h for h in heard}.values())
+    return len(known) - sum(1 for i in match_known(songs, known) if i is not None)
+
+
+def refine_targets(results):
+    """Clips worth asking about to pin down where each song starts.
+
+    A song started somewhere between the last clip before its first hit (where something else, or nothing, was
+    heard) and that first hit. Shazam's offset narrows it from below: the song can't have started before
+    "clip start - position in the song". If that point falls inside the gap, ask about the clip right there - if
+    the song is heard, it was played from the top and the start is settled in one go. Otherwise halve the gap."""
+    asked = sorted(results)
+    first, ests = {}, {}
+    for t in asked:
+        h = results[t]
+        if h:
+            first.setdefault(h["key"], t)
+            if h["offset"]:
+                ests.setdefault(h["key"], []).append(t - h["offset"])
+    targets = set()
+    for key, t in first.items():
+        before = [x for x in asked if x < t]
+        if not before:
+            continue
+        lo = before[-1]
+        est = math.ceil(statistics.median(ests[key])) if key in ests else None
+        if est is not None and lo < est < t:
+            if t - est > REFINE_TO:
+                targets.add(est)
+        elif t - lo > REFINE_TO:
+            targets.add((lo + t) // 2)
+    return sorted(targets - set(asked))
+
+
+async def scan(audio, duration, step, clip_len, concurrency, cache_path=None, known=None, adaptive=True):
+    """Ask Shazam what short clips of the mix are. Returns {"hits", "asked", "implied"} (see merge_hits).
+
+    adaptive (default) asks fewer clips where nothing changes and more where it matters:
+      1. quick pass   - a clip every 2 x step
+      2. fill gaps    - the clips in between, but only where the two neighbours disagree or weren't recognised.
+                        Skipped entirely when a posted tracklist is given and every song on it was already heard.
+      3. missing      - if posted songs are still missing, extra clips around the unrecognised stretches
+      4. start times  - for each song, halve the gap between "first heard" and the clip before it until the
+                        start is known to within REFINE_TO seconds
+    adaptive=False is the old behaviour: every clip on the step grid, nothing else.
+    With cache_path, answers are saved as they arrive, so a retry after a crash/restart only asks about the
+    clips that are still missing."""
     from shazamio import Shazam
 
     shazam = Shazam()
     proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
     sem = asyncio.Semaphore(concurrency)
     tmp = tempfile.mkdtemp(prefix="trackid_")
-    starts = [t for t in range(0, int(duration - clip_len / 2), step)]
-    hits, done = [], 0
+    last_start = int(duration - clip_len / 2)
+    grid = list(range(0, last_start, step))
     cache = load_scan_cache(cache_path, clip_len) if cache_path else {}
     if cache:
-        print(f"  reusing {sum(1 for t in starts if t in cache)} clips from an earlier scan", file=sys.stderr)
-    seen = {}  # key -> (first time, "Artist - Title") for the live list
-    started = time.time()
-    progress("scan", 15, f"Listening to the mix: 0 of {len(starts)} clips", found=[])
+        print(f"  reusing {len(cache)} clips from an earlier scan", file=sys.stderr)
+    results = {}  # clip start -> hit dict, or None (nothing recognised / Shazam couldn't be asked)
+    seen = {}     # key -> (first time, "Artist - Title") for the live list
+    progress("scan", 15, f"Listening to the mix: 0 of {len(grid[::2] if adaptive else grid)} clips", found=[])
 
     async def ask(t):
         """One clip -> hit dict, or None if Shazam heard nothing. Raises if Shazam couldn't be asked."""
@@ -288,58 +358,110 @@ async def scan(audio, duration, step, clip_len, concurrency, cache_path=None):
         return {"t": t, "key": track.get("key"), "title": track.get("title", ""),
                 "artist": track.get("subtitle", ""), "offset": offset, "url": track.get("url", "")}
 
-    async def one(t):
-        nonlocal done
-        if t in cache:
-            hit = cache[t]
-        else:
-            async with sem:
-                try:
-                    hit = await ask(t)
-                    cache[t] = hit
-                except Exception as e:  # not cached, so a retry asks again
-                    print(f"\n  ! {fmt_ts(t)} skipped: {type(e).__name__} {e}", file=sys.stderr)
-                    hit = None
-            if cache_path and len(cache) % 10 == 0:
-                save_scan_cache(cache_path, clip_len, cache)
-        done += 1
-        print(f"\r  scanning {done}/{len(starts)} clips", end="", file=sys.stderr, flush=True)
-        if hit and hit["key"] not in seen:
-            seen[hit["key"]] = (t, f'{hit["artist"]} - {hit["title"]}')
-        found = [f"{fmt_ts(tt)}  {name}" for tt, name in sorted(seen.values())]
-        progress("scan", 15 + 75 * done / len(starts),
-                 f"Listening to the mix: clip {done} of {len(starts)} · {len(seen)} songs recognised so far"
-                 + eta_text(started, done, len(starts)), found=found)
-        if hit:
-            hits.append(hit)
+    async def ask_all(times, what, pct_from, pct_to):
+        times = [t for t in times if t not in results]
+        if not times:
+            return
+        started, done = time.time(), 0
 
+        async def one(t):
+            nonlocal done
+            if t in cache:
+                hit = cache[t]
+            else:
+                async with sem:
+                    try:
+                        hit = await ask(t)
+                        cache[t] = hit
+                    except Exception as e:  # not cached, so a retry asks again
+                        print(f"\n  ! {fmt_ts(t)} skipped: {type(e).__name__} {e}", file=sys.stderr)
+                        hit = None
+                if cache_path and len(cache) % 10 == 0:
+                    save_scan_cache(cache_path, clip_len, cache)
+            results[t] = hit
+            done += 1
+            print(f"\r  {what}: {done}/{len(times)} clips", end="", file=sys.stderr, flush=True)
+            if hit and hit["key"] not in seen:
+                seen[hit["key"]] = (t, f'{hit["artist"]} - {hit["title"]}')
+            found = [f"{fmt_ts(tt)}  {name}" for tt, name in sorted(seen.values())]
+            progress("scan", pct_from + (pct_to - pct_from) * done / len(times),
+                     f"Listening to the mix ({what}): clip {done} of {len(times)} · {len(seen)} songs recognised so far"
+                     + eta_text(started, done, len(times)), found=found)
+
+        await asyncio.gather(*(one(t) for t in times))
+        print(file=sys.stderr)
+
+    def key_at(t):
+        return (results.get(t) or {}).get("key")
+
+    def heard():
+        return [h for h in results.values() if h]
+
+    implied = {}  # key -> clips we didn't ask about because both neighbours were this song
     try:
-        await asyncio.gather(*(one(t) for t in starts))
+        if not adaptive:
+            await ask_all(grid, "every clip", 15, 90)
+        else:
+            await ask_all(grid[::2], "quick pass", 15, 50)
+            all_found = bool(known) and missing_known(heard(), known) == 0
+            fill = []
+            for t in grid[1::2]:
+                a, b = key_at(t - step), key_at(t + step)
+                if a and a == b:
+                    implied[a] = implied.get(a, 0) + 1
+                elif not all_found:
+                    fill.append(t)
+            await ask_all(fill, "filling the gaps", 50, 68)
+            if known and missing_known(heard(), known):
+                half = max(1, step // 2)
+                extra = sorted({x for t in grid if key_at(t) is None for x in (t - half, t + half)
+                                if 0 <= x < last_start})
+                await ask_all(extra, "looking for songs still missing", 68, 74)
+            for rnd in range(REFINE_ROUNDS):
+                mids = refine_targets(results)
+                if not mids:
+                    break
+                await ask_all(mids, "pinning down start times", 74 + 16 * rnd / REFINE_ROUNDS,
+                              74 + 16 * (rnd + 1) / REFINE_ROUNDS)
     finally:
         if cache_path:
             save_scan_cache(cache_path, clip_len, cache)
         await shazam.http_client.close()  # avoids "Unclosed client session" noise in logs
-    print(file=sys.stderr)
-    shutil.rmtree(tmp, ignore_errors=True)
-    return sorted(hits, key=lambda h: h["t"])
+        shutil.rmtree(tmp, ignore_errors=True)
+    on_grid = set(grid)
+    hits = sorted((dict(h, grid=t in on_grid) for t, h in results.items() if h), key=lambda h: h["t"])
+    print(f"  asked about {len(results)} clips ({len(grid)} would be every clip)", file=sys.stderr)
+    return {"hits": hits, "asked": {t: (h or {}).get("key") for t, h in results.items()}, "implied": implied}
 
 
-def merge_hits(hits, step):
-    """Group clip hits by song -> one entry per song with an estimated start time."""
+def merge_hits(hits, step, asked=None, implied=None):
+    """Group clip hits by song -> one entry per song with an estimated start time.
+
+    asked   = {clip start: key or None} for every clip Shazam was asked about (from scan). The latest clip before
+              a song's first hit bounds how early the song can have started. Without it: one step before.
+    implied = {key: n} clips skipped because both neighbours were that song; they count as heard."""
     by_key = {}
     for h in hits:
         by_key.setdefault(h["key"], []).append(h)
+    asked_times = sorted(asked) if asked else None
     songs = []
     for key, hs in by_key.items():
         first = min(h["t"] for h in hs)
-        # where the song started in the mix = clip start - position inside the song.
-        # DJs often drop in mid-song, so never put it earlier than ~1 step before first hit.
+        if asked_times is None:
+            lo = first - step
+        else:
+            lo = max((t for t in asked_times if t < first), default=0)
+        # where the song started in the mix = clip start - position inside the song. That is exact when the DJ
+        # plays the song from its beginning, but DJs often drop in mid-song, so keep it between the last clip
+        # where the song wasn't heard yet and the first clip where it was.
         est = [h["t"] - h["offset"] for h in hs if h["offset"]]
         start = statistics.median(est) if est else first
-        start = max(start, first - step, 0)
+        start = max(min(start, first + 10), lo, 0)
+        # "how sure" counts clips on the regular grid only: the extra start-time clips overlap each other
+        count = sum(1 for h in hs if h.get("grid", True)) + (implied or {}).get(key, 0)
         songs.append({
             "key": key, "artist": hs[0]["artist"], "title": hs[0]["title"], "url": hs[0]["url"],
-            "start": start, "first": first, "last": max(h["t"] for h in hs), "hits": len(hs),
+            "start": start, "first": first, "last": max(h["t"] for h in hs), "hits": max(1, count),
         })
     songs.sort(key=lambda s: s["start"])
     # a single isolated hit inside another song's run is usually a sample / misfire
@@ -352,17 +474,10 @@ def merge_hits(hits, step):
 
 def reconcile(songs, known, duration, posted_order_is_reliable=True):
     rows = []
-    used_known = set()
-    for s in songs:
-        best, best_i = 0.0, None
-        for i, k in enumerate(known):
-            if i in used_known:
-                continue
-            sc = title_similarity(k, s)
-            if sc > best:
-                best, best_i = sc, i
-        if best_i is not None and best >= 0.6:
-            used_known.add(best_i)
+    matched = match_known(songs, known)
+    used_known = {i for i in matched if i is not None}
+    for s, best_i in zip(songs, matched):
+        if best_i is not None:
             k = known[best_i]
             rows.append({**s, "artist": k["artist"] or s["artist"], "title": k["title"],
                          "shazam": f'{s["artist"]} - {s["title"]}', "source": "posted+shazam",
@@ -565,7 +680,7 @@ def segments_from_rows(rows, duration):
 
 
 def analyze(source, state_dir, tracklist_text=None, unordered=False, comments=False, step=30, clip=12,
-            concurrency=4, min_confidence="low", include_estimated=True, verify=False):
+            concurrency=4, min_confidence="low", include_estimated=True, verify=False, simple_scan=False):
     """Find the songs and save everything needed to split later into state_dir/state.json."""
     state_dir = Path(state_dir)
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -619,10 +734,12 @@ def analyze(source, state_dir, tracklist_text=None, unordered=False, comments=Fa
         progress("match", 92, "Every song has a timestamp - using them directly, no listening needed")
         rows = reconcile([], known, duration)
     else:
-        log(f"Identifying songs (one {clip}s clip every {step}s)...")
-        hits = asyncio.run(scan(audio, duration, step, clip, concurrency, cache_path=state_dir / "scan_cache.json"))
+        log(f"Identifying songs ({clip}s clips, " + (f"one every {step}s" if simple_scan else
+            f"quick pass every {2 * step}s, then closer where needed") + ")...")
+        heard = asyncio.run(scan(audio, duration, step, clip, concurrency, cache_path=state_dir / "scan_cache.json",
+                                 known=known, adaptive=not simple_scan))
         progress("match", 92, "Matching what was heard against the tracklist...")
-        songs = merge_hits(hits, step)
+        songs = merge_hits(heard["hits"], step, heard["asked"], heard["implied"])
         rank = {"low": 0, "medium": 1, "high": 2}
         songs = [s for s in songs if rank[s["confidence"]] >= rank[min_confidence]]
         rows = reconcile(songs, known, duration, posted_order_is_reliable=not unordered)
@@ -760,6 +877,9 @@ def main():
     ap.add_argument("--concurrency", type=int, default=4, help="parallel Shazam requests (default 4)")
     ap.add_argument("--verify", action="store_true",
                     help="scan with Shazam even when every song already has a timestamp")
+    ap.add_argument("--simple-scan", action="store_true",
+                    help="ask Shazam about every clip on the --step grid and nothing else (the old behaviour), "
+                         "instead of a quick pass plus closer listening where songs change")
     ap.add_argument("--min-confidence", choices=["low", "medium", "high"], default="low")
     ap.add_argument("--out", default="output", help="folder for the CSV/chapters reports (default ./output)")
     ap.add_argument("--analyze-only", metavar="JOB_DIR",
@@ -770,7 +890,8 @@ def main():
 
     analyze_args = dict(tracklist_text=Path(a.tracklist).read_text(encoding="utf-8") if a.tracklist else None,
                         unordered=a.unordered, comments=a.comments, step=a.step, clip=a.clip,
-                        concurrency=a.concurrency, min_confidence=a.min_confidence, verify=a.verify)
+                        concurrency=a.concurrency, min_confidence=a.min_confidence, verify=a.verify,
+                        simple_scan=a.simple_scan)
     if a.split_job:
         if not a.library:
             ap.error("--split-job needs --library (or MUSIC_LIBRARY)")

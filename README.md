@@ -65,14 +65,27 @@ Leave off `--library` to get just the tracklist (CSV + YouTube chapter text in `
 | `--comments` | the tracklist is in a YouTube comment |
 | `--confirmed-only` | only cut where Shazam actually heard a song (no estimated `~` cuts) |
 | `--keep-full-mix` | also save the whole mix in the album folder |
-| `--step 15` | quick-cut mixes (more samples, slower) |
+| `--step 15` | quick-cut mixes (quick pass every 30 s, gaps every 15 s; slower) |
 | `--format m4a` | AAC instead of MP3 |
 
 ## How songs are found and cut
 1. yt-dlp reads the title, chapters and description. If there's a tracklist, it's used for correct names.
-2. A 12-second clip every 30 seconds goes to Shazam. Hits are matched to the posted list, so the timestamps come from the audio.
-3. Posted songs Shazam missed are placed by their posted order (estimated `~` cut points).
-4. Single stray hits that aren't on the posted list (usually samples) are ignored when cutting.
+   If every song on it has a timestamp, those are used and nothing below is needed.
+2. Shazam is asked about 12-second clips of the mix, in stages:
+   - **Quick pass**: a clip every 60 seconds.
+   - **Fill the gaps**: the clips in between (every 30 seconds), but only where the two neighbours disagree or
+     weren't recognised. Skipped when every song on the posted tracklist has already been heard.
+   - **Missing songs**: if posted songs still haven't been heard, extra clips around the unrecognised stretches.
+   - **Start times**: for each song, a few more clips between "first heard" and the clip before it, until the
+     start is known to within about 8 seconds. A song played from its beginning is placed exactly, using
+     Shazam's position-in-song; a song the DJ drops into mid-way is cut a few seconds early rather than late.
+3. Hits are matched to the posted list, so the names come from the list and the times from the audio.
+4. Posted songs Shazam never heard are placed by their posted order (estimated `~` cut points).
+5. Single stray hits that aren't on the posted list (usually samples) are ignored when cutting.
+
+Long songs need fewer Shazam lookups than before; mixes with many short songs need more, because every
+song's start is checked. `--simple-scan` on the command line goes back to one clip every `--step` seconds
+and nothing else.
 
 Cut points are where the next song *starts* in the mix. With blends, each file starts as the new song comes in, so you'll hear a few seconds of the previous song's tail.
 
