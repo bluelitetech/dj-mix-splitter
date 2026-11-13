@@ -1,0 +1,19 @@
+# Paste this into your NAS's Docker "Project / Compose" screen.
+# Change the ONE line marked CHANGE ME to the folder Navidrome uses for music.
+services:
+  mix-splitter:
+    image: ghcr.io/bluelitetech/dj-mix-splitter:latest
+    container_name: mix-splitter
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+    volumes:
+      - /volume1/Music:/music              # CHANGE ME: same host folder Navidrome mounts as /music
+      - mix-splitter-data:/data            # job logs + reports (+ cookies.txt if ever needed)
+    environment:
+      - MUSIC_LIBRARY=/music/DJ Mixes      # songs land in <music>/DJ Mixes/<DJ>/<Mix>/
+      - TZ=America/New_York
+      # - YTDLP_COOKIES=/data/cookies.txt  # only if YouTube starts asking to sign in
+
+volumes:
+  mix-splitter-data:
