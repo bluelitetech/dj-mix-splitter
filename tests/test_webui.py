@@ -130,3 +130,16 @@ def test_navidrome_scan(ui, monkeypatch):
     assert seen["url"].startswith("http://navidrome:4533/rest/startScan.view?u=admin&t=") and "secret" not in seen["url"]
     seen["reply"] = {"status": "failed", "error": {"message": "Wrong username or password"}}
     assert ui.navidrome_scan() == "Wrong username or password"
+
+
+def test_save_after_dragging_songs_to_other_rows(ui):
+    d = make_job(ui)
+    # the two analysed songs were swapped on the page: row 0 (00:00) now holds song 1, row 1 (03:20) holds song 0
+    form = {"album": "Mix", "album_artist": "DJ",
+            "inc_0": "on", "time_0": "00:00", "artist_0": "B", "title_0": "Two", "src_0": "1",
+            "inc_1": "on", "time_1": "03:20", "artist_1": "A", "title_1": "One", "src_1": "0",
+            "inc_2": "on", "time_2": "", "artist_2": "", "title_2": "", "src_2": ""}
+    post(ui, "/job/1/split", form)
+    rows = json.loads((d / "reviewed.json").read_text())
+    assert [(r["title"], r["start"], r["include"], r["confidence"]) for r in rows] == [
+        ("Two", 0, True, "edited"), ("One", 200, True, "edited")]

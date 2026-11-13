@@ -25,7 +25,8 @@ Open `http://<server-ip>:8765` (or your Cloudflare URL), paste a link and choose
   listen → review → save), and songs appear in a list as Shazam recognises them. When it finishes you get an
   editable tracklist: fix names or start times, untick samples or intros, add as many missed songs as you
   need (**+ Add another song**), and press ▶ to play the downloaded mix in the page from whatever time is
-  typed in that row. Nothing touches your library until you press **Save**.
+  typed in that row. If a song sits at the wrong time, drag it by its ⠿ handle onto the row with the right
+  time: the songs in between shift along and the times stay put. Nothing touches your library until you press **Save**.
 - **Find + save straight away**: same thing with no review step.
 
 The form also has the options that used to be command-line only: quick-cut mixes (a clip every 15 s),
