@@ -231,7 +231,10 @@ async def scan(audio, duration, step, clip_len, concurrency):
             "url": track.get("url", ""),
         })
 
-    await asyncio.gather(*(one(t) for t in starts))
+    try:
+        await asyncio.gather(*(one(t) for t in starts))
+    finally:
+        await shazam.http_client.close()  # avoids "Unclosed client session" noise in logs
     print(file=sys.stderr)
     shutil.rmtree(tmp, ignore_errors=True)
     return sorted(hits, key=lambda h: h["t"])

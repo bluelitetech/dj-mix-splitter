@@ -71,7 +71,13 @@ def shazam():
         subprocess.run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=8",
                         "-ac", "1", "-ar", "16000", wav], check=True)
         proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
-        res = asyncio.run(Shazam().recognize(wav, proxy=proxy) if proxy else Shazam().recognize(wav))
+        async def once():
+            shz = Shazam()
+            try:
+                return await (shz.recognize(wav, proxy=proxy) if proxy else shz.recognize(wav))
+            finally:
+                await shz.http_client.close()
+        res = asyncio.run(once())
         if "matches" not in res:
             raise RuntimeError(f"unexpected reply: {str(res)[:200]}")
         return "Shazam answered"
