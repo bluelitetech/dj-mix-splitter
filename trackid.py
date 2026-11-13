@@ -510,7 +510,7 @@ def segments_from_rows(rows, duration):
 
 
 def analyze(source, state_dir, tracklist_text=None, unordered=False, comments=False, step=30, clip=12,
-            concurrency=3, min_confidence="low", include_estimated=True):
+            concurrency=4, min_confidence="low", include_estimated=True, verify=False):
     """Find the songs and save everything needed to split later into state_dir/state.json."""
     state_dir = Path(state_dir)
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -557,13 +557,20 @@ def analyze(source, state_dir, tracklist_text=None, unordered=False, comments=Fa
         label = Path(audio).stem
 
     duration = audio_duration(audio)
-    log(f"Identifying songs (one {clip}s clip every {step}s)...")
-    hits = asyncio.run(scan(audio, duration, step, clip, concurrency))
-    progress("match", 92, "Matching what was heard against the tracklist...")
-    songs = merge_hits(hits, step)
-    rank = {"low": 0, "medium": 1, "high": 2}
-    songs = [s for s in songs if rank[s["confidence"]] >= rank[min_confidence]]
-    rows = reconcile(songs, known, duration, posted_order_is_reliable=not unordered)
+    all_timed = bool(known) and all(k["time"] is not None for k in known)
+    if all_timed and not verify:
+        # The uploader already gave every start time: no need to listen at all.
+        log("Every song has a timestamp - using them (no Shazam scan needed).")
+        progress("match", 92, "Every song has a timestamp - using them directly, no listening needed")
+        rows = reconcile([], known, duration)
+    else:
+        log(f"Identifying songs (one {clip}s clip every {step}s)...")
+        hits = asyncio.run(scan(audio, duration, step, clip, concurrency))
+        progress("match", 92, "Matching what was heard against the tracklist...")
+        songs = merge_hits(hits, step)
+        rank = {"low": 0, "medium": 1, "high": 2}
+        songs = [s for s in songs if rank[s["confidence"]] >= rank[min_confidence]]
+        rows = reconcile(songs, known, duration, posted_order_is_reliable=not unordered)
 
     cut = {id(r) for _, _, r in split_points(rows, duration, include_estimated=include_estimated)}
     for r in rows:
@@ -695,7 +702,9 @@ def main():
     ap.add_argument("--album-artist", help="override album artist (default: YouTube channel = the DJ)")
     ap.add_argument("--step", type=int, default=30, help="seconds between samples (default 30)")
     ap.add_argument("--clip", type=int, default=12, help="clip length in seconds (default 12)")
-    ap.add_argument("--concurrency", type=int, default=3, help="parallel Shazam requests (default 3)")
+    ap.add_argument("--concurrency", type=int, default=4, help="parallel Shazam requests (default 4)")
+    ap.add_argument("--verify", action="store_true",
+                    help="scan with Shazam even when every song already has a timestamp")
     ap.add_argument("--min-confidence", choices=["low", "medium", "high"], default="low")
     ap.add_argument("--out", default="output", help="folder for the CSV/chapters reports (default ./output)")
     ap.add_argument("--analyze-only", metavar="JOB_DIR",
@@ -706,7 +715,7 @@ def main():
 
     analyze_args = dict(tracklist_text=Path(a.tracklist).read_text(encoding="utf-8") if a.tracklist else None,
                         unordered=a.unordered, comments=a.comments, step=a.step, clip=a.clip,
-                        concurrency=a.concurrency, min_confidence=a.min_confidence)
+                        concurrency=a.concurrency, min_confidence=a.min_confidence, verify=a.verify)
     if a.split_job:
         if not a.library:
             ap.error("--split-job needs --library (or MUSIC_LIBRARY)")

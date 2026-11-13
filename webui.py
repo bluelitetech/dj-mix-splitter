@@ -129,6 +129,8 @@ def worker():
                     args.append("--unordered")
                 if job["opts"].get("comments"):
                     args.append("--comments")
+                if job["opts"].get("verify"):
+                    args.append("--verify")
                 rc = run(job, args)
                 if rc != 0:
                     job.update(status="failed", error=last_error(job))
@@ -290,6 +292,7 @@ def home():
 <label><input type="checkbox" name="unordered"> The tracklist is not in play order</label>
 <label><input type="checkbox" name="comments"> Look for a tracklist in the YouTube comments</label>
 <label><input type="checkbox" name="full"> Also keep the full mix as one file</label>
+<label><input type="checkbox" name="verify"> Double-check timestamped tracklists with Shazam (slower)</label>
 <div class="row" style="margin-top:10px"><button name="mode" value="review">Find the songs (review before saving)</button>
 <button name="mode" value="auto" class="secondary">Find + save straight away</button></div></form></div>"""
     cards = []
@@ -458,7 +461,7 @@ class H(BaseHTTPRequestHandler):
             jdir(jid).mkdir(parents=True, exist_ok=True)
             save({"id": jid, "kind": "mix", "url": url, "status": "queued", "added": time.strftime("%b %d %H:%M"),
                   "opts": {"tracklist": form.get("tracklist", ""), "unordered": "unordered" in form,
-                           "comments": "comments" in form, "full": "full" in form,
+                           "comments": "comments" in form, "full": "full" in form, "verify": "verify" in form,
                            "auto": form.get("mode") == "auto"}})
             work.put((jid, "analyze"))
             return self.redirect(f"/job/{jid}")
