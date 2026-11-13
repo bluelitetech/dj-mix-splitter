@@ -23,11 +23,32 @@ Open `http://<server-ip>:8765` (or your Cloudflare URL), paste a link and choose
 
 - **Find the songs (review before saving)**: recommended. A progress bar shows each step (read video → download →
   listen → review → save), and songs appear in a list as Shazam recognises them. When it finishes you get an
-  editable tracklist: fix names or start times, untick samples or intros, add a song that was missed, and press
-  ▶ to play the mix from any song's start to check it. Nothing touches your library until you press **Save**.
+  editable tracklist: fix names or start times, untick samples or intros, add as many missed songs as you
+  need (**+ Add another song**), and press ▶ to play the downloaded mix in the page from whatever time is
+  typed in that row. Nothing touches your library until you press **Save**.
 - **Find + save straight away**: same thing with no review step.
 
+The form also has the options that used to be command-line only: quick-cut mixes (a clip every 15 s),
+only ticking songs Shazam actually heard, and saving as M4A instead of MP3.
+
 Reviews are kept in `/data`, so they survive a container restart. Use **Run self-test** to check the setup.
+
+**If a job fails or the container restarts mid-job**, open it and press **Try again**. The audio that was
+already downloaded and the clips Shazam already answered are reused; if only the saving failed you go
+straight back to the review.
+
+**Saving the same mix again** replaces the album: numbered song files from the earlier save that aren't in
+the new tracklist are deleted from that album folder (the full-mix file and everything else is left alone).
+
+### Rescan Navidrome automatically (optional)
+Set these three variables and a library scan starts as soon as songs are saved. The user must be a
+Navidrome **admin**; the URL is how this container reaches Navidrome (e.g. `http://<nas-ip>:4533`).
+```yaml
+      - NAVIDROME_URL=http://192.168.1.10:4533
+      - NAVIDROME_USER=admin
+      - NAVIDROME_PASSWORD=your-password
+```
+Without them, songs appear after Navidrome's next scheduled scan.
 
 ## Option B: command line
 Requires Python 3.10+, ffmpeg and deno.

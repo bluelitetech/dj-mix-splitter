@@ -100,3 +100,57 @@ def test_friendly_labels():
     assert t.friendly_confidence({"confidence": "estimated (~)"})[0] == "est"
     assert t.friendly_confidence({"confidence": "high", "source": "posted+shazam", "hits": 4})[1].startswith("Confirmed")
     assert t.friendly_confidence({"confidence": "low (not on posted list)"})[0] == "warn"
+
+
+def test_resave_removes_old_numbered_files(tmp_path):
+    mix = tmp_path / "mix.m4a"
+    subprocess.run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=330:duration=90",
+                    "-c:a", "aac", str(mix)], check=True)
+    row = lambda artist, title: {"artist": artist, "title": title}  # noqa: E731
+    args = (tmp_path / "lib", "Test Mix", "DJ Test", "2025", "", None)
+    folder, first = t.write_tracks(str(mix), [(0, 30, row("A", "One")), (30, 60, row("B", "Two")),
+                                              (60, 90, row("C", "Three"))], *args)
+    (folder / "00 - Test Mix (Full Mix).m4a").write_bytes(b"x")
+    (folder / "tracklist.csv").write_text("x")
+    folder, second = t.write_tracks(str(mix), [(0, 45, row("A", "One")), (45, 90, row("C", "Three"))], *args)
+    assert sorted(p.name for p in folder.iterdir()) == [
+        "00 - Test Mix (Full Mix).m4a", "01 - A - One.mp3", "02 - C - Three.mp3", "tracklist.csv"]
+
+
+def test_scan_resumes_from_cache(tmp_path, monkeypatch):
+    import asyncio
+    import types
+    mix = tmp_path / "mix.wav"
+    subprocess.run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=330:duration=120",
+                    str(mix)], check=True)
+    asked = []
+
+    class FakeShazam:
+        def __init__(self):
+            self.http_client = types.SimpleNamespace(close=self._close)
+
+        async def _close(self):
+            pass
+
+        async def recognize(self, clip, proxy=None):
+            start = int(Path(clip).stem)
+            asked.append(start)
+            if start == 60:
+                raise RuntimeError("rate limited")
+            return {"track": {"key": "k1", "title": "Song", "subtitle": "Artist"}, "matches": [{"offset": 5}]}
+
+    async def no_sleep(_):
+        pass
+
+    monkeypatch.setitem(sys.modules, "shazamio", types.SimpleNamespace(Shazam=FakeShazam))
+    monkeypatch.setattr(t.asyncio, "sleep", no_sleep)
+    monkeypatch.delenv("HTTPS_PROXY", raising=False)
+    monkeypatch.delenv("https_proxy", raising=False)
+    cache = tmp_path / "scan_cache.json"
+    hits = asyncio.run(t.scan(str(mix), 120, 30, 12, 2, cache_path=cache))
+    assert sorted(h["t"] for h in hits) == [0, 30, 90]
+    assert sorted(set(asked)) == [0, 30, 60, 90]
+    asked.clear()
+    hits = asyncio.run(t.scan(str(mix), 120, 30, 12, 2, cache_path=cache))
+    assert sorted(h["t"] for h in hits) == [0, 30, 90]
+    assert set(asked) == {60}  # only the clip that failed last time is asked again
