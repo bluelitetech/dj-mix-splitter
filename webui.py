@@ -242,6 +242,9 @@ max-height:360px;overflow:auto}.row{display:flex;gap:10px;flex-wrap:wrap;align-i
 button.play{padding:3px 8px;font-size:13px;background:#374151;margin-left:4px}
 select{padding:7px;font-size:14px;background:#0b0d11;color:var(--text);border:1px solid var(--line);border-radius:6px}
 .player{position:sticky;top:0;z-index:2;background:var(--card);padding:6px 0}.player audio{width:100%}
+.grip{display:flex;align-items:center;gap:6px}.handle{cursor:grab;touch-action:none;user-select:none;color:var(--muted);
+font-size:18px;padding:4px 2px}tr.dragging td.song{opacity:.4}tr.drop td{border-top:2px solid var(--accent)}
+tr.moved td.song{background:#1e3a8a55;transition:background .9s}
 .joblink{display:flex;justify-content:space-between;gap:10px;align-items:center;text-decoration:none;color:inherit}
 """
 
@@ -372,6 +375,7 @@ def yt_link(state, seconds):
             f'title="Open YouTube at this point" style="text-decoration:none">&#8599;</a>')
 
 
+GRIP = '<span class="handle" title="Drag to move this song to another start time">&#10303;</span>'
 PLAY_BTN = '<button type="button" class="play" title="Play the mix from this time" onclick="playFrom(this)">&#9654;</button>'
 
 
@@ -379,8 +383,9 @@ def blank_row(i):
     """Empty row for adding a song that was missed (the page's "Add another song" button makes more of these)."""
     return f"""<tr><td><input type="checkbox" name="inc_{i}" checked></td>
 <td class="t" style="white-space:nowrap"><input type="text" name="time_{i}" placeholder="mm:ss">{PLAY_BTN}</td>
-<td><input type="text" name="artist_{i}" placeholder="Add a missing song"></td>
-<td><input type="text" name="title_{i}" placeholder="Title"></td><td class="hide-m"></td></tr>"""
+<td class="song"><div class="grip">{GRIP}<input type="text" name="artist_{i}" placeholder="Add a missing song"></div></td>
+<td class="song"><input type="text" name="title_{i}" placeholder="Title"><input type="hidden" name="src_{i}" value=""></td>
+<td class="song hide-m"></td></tr>"""
 
 
 REVIEW_JS = """<script>
@@ -392,6 +397,22 @@ if(p.readyState>0)go();else{p.addEventListener('loadedmetadata',go,{once:true});
 function addRow(){const t=document.getElementById('tracks'),i=t.querySelectorAll('input[name^=title_]').length;
 t.tBodies[0].insertAdjacentHTML('beforeend',%s.replace(/__I__/g,i));
 t.querySelector('input[name=time_'+i+']').focus()}
+// Drag a song by its handle onto another row: the songs in between shift along, the start times and ticks stay put.
+(function(){const t=document.getElementById('tracks');let from=null,over=null;
+const rows=()=>Array.from(t.tBodies[0].rows).filter(r=>r.querySelector('td.song'));
+const rowAt=e=>{const el=document.elementFromPoint(e.clientX,e.clientY),r=el&&el.closest('tr');return r&&rows().includes(r)?r:null};
+const mark=r=>{if(over)over.classList.remove('drop');over=r;if(over&&over!==from)over.classList.add('drop')};
+function move(a,b){const rs=rows(),cells=rs.map(r=>Array.from(r.querySelectorAll('td.song'))),order=rs.map((_,i)=>i);
+order.splice(b,0,order.splice(a,1)[0]);
+rs.forEach((r,i)=>{cells[order[i]].forEach(c=>r.appendChild(c));
+r.querySelectorAll('td.song input').forEach(x=>x.name=x.name.replace(/_\\d+$/,'_'+i))})}
+t.addEventListener('pointerdown',e=>{const h=e.target.closest('.handle');if(!h)return;e.preventDefault();
+from=h.closest('tr');from.classList.add('dragging');h.setPointerCapture(e.pointerId)});
+t.addEventListener('pointermove',e=>{if(from)mark(rowAt(e))});
+const end=e=>{if(!from)return;const to=e.type==='pointerup'?rowAt(e):null,rs=rows();
+if(to&&to!==from){move(rs.indexOf(from),rs.indexOf(to));to.classList.add('moved');setTimeout(()=>to.classList.remove('moved'),900)}
+from.classList.remove('dragging');mark(null);from=null};
+t.addEventListener('pointerup',end);t.addEventListener('pointercancel',end)})();
 </script>""" % json.dumps(blank_row("__I__"))
 
 
@@ -407,9 +428,9 @@ def review_table(job, state):
         trs.append(f"""<tr class="{'' if r.get('include') else 'off'}">
 <td><input type="checkbox" name="inc_{i}" {'checked' if r.get('include') else ''}></td>
 <td class="t" style="white-space:nowrap"><input type="text" name="time_{i}" value="{t}" placeholder="mm:ss">{PLAY_BTN}{yt_link(state, r.get("start"))}</td>
-<td><input type="text" name="artist_{i}" value="{html.escape(r['artist'] or '')}"></td>
-<td><input type="text" name="title_{i}" value="{html.escape(r['title'] or '')}">{heard_note}</td>
-<td class="hide-m"><small class="c-{level}">{html.escape(label)}</small></td></tr>""")
+<td class="song"><div class="grip">{GRIP}<input type="text" name="artist_{i}" value="{html.escape(r['artist'] or '')}"></div></td>
+<td class="song"><input type="text" name="title_{i}" value="{html.escape(r['title'] or '')}"><input type="hidden" name="src_{i}" value="{i}">{heard_note}</td>
+<td class="song hide-m"><small class="c-{level}">{html.escape(label)}</small></td></tr>""")
     trs += [blank_row(i) for i in range(len(rows), len(rows) + 3)]
     return rows, f"""<table id="tracks"><tr><th title="Save as its own song">Save</th><th>Starts at</th><th>Artist</th><th>Title</th>
 <th class="hide-m">How sure</th></tr>{''.join(trs)}</table>
@@ -438,7 +459,8 @@ def job_page(jid):
         n_inc = sum(1 for r in state["rows"] if r.get("include"))
         parts.append(f"""<div class="card"><h2>Check the tracklist</h2>
 <p class="muted">Ticked songs become separate files, cut where each one <i>starts</i>. Fix any names or times, untick anything
-that shouldn't be its own song (samples, short intros), or add a song Shazam missed. Times are where the song starts in the mix
+that shouldn't be its own song (samples, short intros), or add a song Shazam missed. If a song is at the wrong time,
+drag it by its &#10303; handle onto the row with the right time: the songs in between shift along and the times stay where they are. Times are where the song starts in the mix
 (press &#9654; to play the mix from that time right here - it uses whatever is typed in the box, so you can try a time
 before saving; &#8599; opens YouTube at that point). The first ticked song also gets any intro before it. {n_inc} of {len(state['rows'])} songs are ticked.</p>
 <p class="muted"><span class="c-ok">Confirmed</span> = Shazam heard it ·
@@ -627,11 +649,14 @@ class H(BaseHTTPRequestHandler):
             reviewed = []
             extra = [int(k[6:]) + 1 for k in form if re.fullmatch(r"title_\d{1,4}", k)]  # rows added on the page
             for i in range(max([len(rows)] + extra)):
-                base = rows[i] if i < len(rows) else {"source": "added", "confidence": "edited", "shazam": "", "url": ""}
+                # src_N = which analysed song now sits in row N (songs can be dragged to another row's start time)
+                src = form.get(f"src_{i}", str(i) if i < len(rows) else "")
+                base = (rows[int(src)] if src.isdigit() and int(src) < len(rows)
+                        else {"source": "added", "confidence": "edited", "shazam": "", "url": ""})
                 artist = form.get(f"artist_{i}", "").strip()
                 title = form.get(f"title_{i}", "").strip()
                 tstr = form.get(f"time_{i}", "").strip()
-                if i >= len(rows) and not (title and tstr):
+                if base.get("source") == "added" and not (title and tstr):
                     continue
                 try:
                     start = parse_ts(tstr) if re.fullmatch(r"\d{1,2}(:\d{1,2}){1,2}", tstr) else None
@@ -639,7 +664,7 @@ class H(BaseHTTPRequestHandler):
                     start = None
                 r = dict(base, artist=artist, title=title or base.get("title", ""), start=start,
                          include=(f"inc_{i}" in form) and start is not None and bool(title or base.get("title")))
-                if i >= len(rows) or artist != base.get("artist") or title != base.get("title") or \
+                if base.get("source") == "added" or artist != base.get("artist") or title != base.get("title") or \
                         (start is not None and base.get("start") is not None and abs(start - base["start"]) >= 1):
                     r["confidence"] = "edited"
                 reviewed.append(r)
