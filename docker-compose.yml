@@ -14,6 +14,10 @@ services:
       - MUSIC_LIBRARY=/music/DJ Mixes      # songs land in <music>/DJ Mixes/<DJ>/<Mix>/
       - TZ=America/New_York
       # - YTDLP_COOKIES=/data/cookies.txt  # only if YouTube starts asking to sign in
+      # Optional: start a Navidrome library scan as soon as songs are saved (needs a Navidrome admin login)
+      # - NAVIDROME_URL=http://<nas-ip>:4533
+      # - NAVIDROME_USER=admin
+      # - NAVIDROME_PASSWORD=your-password
 
 volumes:
   mix-splitter-data:

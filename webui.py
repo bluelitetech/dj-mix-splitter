@@ -9,6 +9,7 @@ Flow per mix:  queued -> analyzing (read video, download, listen) -> review (you
 Jobs are kept in DATA_DIR/jobs/<id>/ so a review survives container restarts.
 Meant for your home network or behind a login (e.g. Cloudflare Access).
 """
+import hashlib
 import html
 import json
 import os
@@ -19,15 +20,22 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlencode
 
 HERE = Path(__file__).resolve().parent
 LIBRARY = os.environ.get("MUSIC_LIBRARY", "/music")
 DATA = Path(os.environ.get("DATA_DIR", HERE / "data"))
 PORT = int(os.environ.get("PORT", "8765"))
 JOBS = DATA / "jobs"
+# Optional: ask Navidrome to rescan as soon as songs are saved (needs a Navidrome admin login)
+NAVIDROME_URL = os.environ.get("NAVIDROME_URL", "").rstrip("/")
+NAVIDROME_USER = os.environ.get("NAVIDROME_USER", "")
+NAVIDROME_PASSWORD = os.environ.get("NAVIDROME_PASSWORD", "")
+AUDIO_TYPES = {".webm": "audio/webm", ".m4a": "audio/mp4", ".mp4": "audio/mp4", ".opus": "audio/ogg",
+               ".ogg": "audio/ogg", ".mp3": "audio/mpeg", ".wav": "audio/wav", ".flac": "audio/flac"}
 JOBS.mkdir(parents=True, exist_ok=True)
 
 sys.path.insert(0, str(HERE))
@@ -105,6 +113,34 @@ def last_error(job):
     return msg[-300:]
 
 
+def navidrome_configured():
+    return bool(NAVIDROME_URL and NAVIDROME_USER and NAVIDROME_PASSWORD)
+
+
+def navidrome_scan():
+    """Start a Navidrome library scan (Subsonic API). Returns "" on success, else a short reason it didn't start."""
+    salt = os.urandom(8).hex()
+    token = hashlib.md5((NAVIDROME_PASSWORD + salt).encode()).hexdigest()
+    query = urlencode({"u": NAVIDROME_USER, "t": token, "s": salt, "v": "1.16.1", "c": "mix-splitter", "f": "json"})
+    try:
+        with urllib.request.urlopen(f"{NAVIDROME_URL}/rest/startScan.view?{query}", timeout=15) as r:
+            reply = json.loads(r.read().decode()).get("subsonic-response", {})
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"[:200]
+    if reply.get("status") != "ok":
+        return str((reply.get("error") or {}).get("message") or reply)[:200]
+    return ""
+
+
+def job_audio(jid):
+    """The downloaded mix for a job (only ever a file inside that job's own folder), or None."""
+    state = read_json(jdir(jid) / "state.json", {}) or {}
+    path = Path(state.get("audio") or "")
+    if path.is_file() and path.resolve().parent == jdir(jid).resolve():
+        return path
+    return None
+
+
 def worker():
     while True:
         jid, action = work.get()
@@ -131,6 +167,10 @@ def worker():
                     args.append("--comments")
                 if job["opts"].get("verify"):
                     args.append("--verify")
+                if job["opts"].get("confirmed"):
+                    args.append("--confirmed-only")
+                if job["opts"].get("step"):
+                    args += ["--step", str(job["opts"]["step"])]
                 rc = run(job, args)
                 if rc != 0:
                     job.update(status="failed", error=last_error(job))
@@ -156,10 +196,13 @@ def worker():
                     args += ["--album-artist", rev["album_artist"]]
                 if rev.get("full", job["opts"].get("full")):
                     args.append("--keep-full-mix")
+                args += ["--format", rev.get("fmt") or job["opts"].get("fmt") or "mp3"]
                 rc = run(job, args)
                 if rc == 0:
                     job["status"] = "done"
                     job["folder"] = progress_of(job).get("folder", "")
+                    if navidrome_configured():
+                        job["scan"] = navidrome_scan() or "started"
                 else:
                     job.update(status="failed", error=last_error(job))
         except Exception as e:  # never let the worker die
@@ -196,6 +239,9 @@ td.t input{width:78px}.c-ok{color:var(--ok)}.c-warn{color:var(--warn)}.c-est{col
 ul.found{columns:2;font-size:13px;padding-left:18px;margin:6px 0}@media(max-width:640px){ul.found{columns:1}
 .hide-m{display:none}}pre{white-space:pre-wrap;font-size:12px;background:#0b0d11;padding:8px;border-radius:6px;
 max-height:360px;overflow:auto}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+button.play{padding:3px 8px;font-size:13px;background:#374151;margin-left:4px}
+select{padding:7px;font-size:14px;background:#0b0d11;color:var(--text);border:1px solid var(--line);border-radius:6px}
+.player{position:sticky;top:0;z-index:2;background:var(--card);padding:6px 0}.player audio{width:100%}
 .joblink{display:flex;justify-content:space-between;gap:10px;align-items:center;text-decoration:none;color:inherit}
 """
 
@@ -293,6 +339,9 @@ def home():
 <label><input type="checkbox" name="comments"> Look for a tracklist in the YouTube comments</label>
 <label><input type="checkbox" name="full"> Also keep the full mix as one file</label>
 <label><input type="checkbox" name="verify"> Double-check timestamped tracklists with Shazam (slower)</label>
+<label><input type="checkbox" name="quick"> Quick-cut mix: listen twice as often (catches short songs, takes twice as long)</label>
+<label><input type="checkbox" name="confirmed"> Only tick songs Shazam actually heard (no estimated cut points)</label>
+<label>Save songs as <select name="fmt"><option value="mp3">MP3 (320 kbps)</option><option value="m4a">M4A (AAC 256 kbps)</option></select></label>
 <div class="row" style="margin-top:10px"><button name="mode" value="review">Find the songs (review before saving)</button>
 <button name="mode" value="auto" class="secondary">Find + save straight away</button></div></form></div>"""
     cards = []
@@ -308,7 +357,8 @@ def home():
 {'<div style="margin-top:8px"><a class="btn" href="/job/%d">Review the tracklist</a></div>' % job['id'] if job['status'] == 'review' else ''}
 </div>""")
     tools = """<form method="post" action="/selftest" style="margin-top:6px"><button class="secondary" style="font-size:13px;padding:6px 12px">
-Run self-test</button> <small>Library: """ + html.escape(LIBRARY) + "</small></form>"
+Run self-test</button> <small>Library: """ + html.escape(LIBRARY) + " · Navidrome rescan after saving: " + (
+        "on" if navidrome_configured() else "off (set NAVIDROME_URL / NAVIDROME_USER / NAVIDROME_PASSWORD)") + "</small></form>"
     busy = any(j["status"] in ("queued", "analyzing", "splitting") for j in jobs.values())
     return page("Mix Splitter", form + tools + "".join(cards), poll="/status" if busy else None).replace("{BODYDATA}", " ".join(datas))
 
@@ -319,7 +369,30 @@ def yt_link(state, seconds):
         return ""
     sep = "&" if "?" in url else "?"
     return (f' <a href="{html.escape(url)}{sep}t={int(seconds)}s" target="_blank" rel="noopener" '
-            f'title="Play the mix from here" style="text-decoration:none">&#9654;</a>')
+            f'title="Open YouTube at this point" style="text-decoration:none">&#8599;</a>')
+
+
+PLAY_BTN = '<button type="button" class="play" title="Play the mix from this time" onclick="playFrom(this)">&#9654;</button>'
+
+
+def blank_row(i):
+    """Empty row for adding a song that was missed (the page's "Add another song" button makes more of these)."""
+    return f"""<tr><td><input type="checkbox" name="inc_{i}" checked></td>
+<td class="t" style="white-space:nowrap"><input type="text" name="time_{i}" placeholder="mm:ss">{PLAY_BTN}</td>
+<td><input type="text" name="artist_{i}" placeholder="Add a missing song"></td>
+<td><input type="text" name="title_{i}" placeholder="Title"></td><td class="hide-m"></td></tr>"""
+
+
+REVIEW_JS = """<script>
+function playFrom(b){const v=b.closest('tr').querySelector('input[name^=time_]').value.trim();
+if(!/^\\d{1,2}(:\\d{1,2}){1,2}$/.test(v)){alert('Type a start time first, like 12:34');return}
+const s=v.split(':').reduce((a,x)=>a*60+Number(x),0),p=document.getElementById('player');
+const go=()=>{p.currentTime=s;p.play()};
+if(p.readyState>0)go();else{p.addEventListener('loadedmetadata',go,{once:true});p.load()}}
+function addRow(){const t=document.getElementById('tracks'),i=t.querySelectorAll('input[name^=title_]').length;
+t.tBodies[0].insertAdjacentHTML('beforeend',%s.replace(/__I__/g,i));
+t.querySelector('input[name=time_'+i+']').focus()}
+</script>""" % json.dumps(blank_row("__I__"))
 
 
 def review_table(job, state):
@@ -333,17 +406,14 @@ def review_table(job, state):
                       if heard and heard.lower() != f'{r["artist"]} - {r["title"]}'.lower() else "")
         trs.append(f"""<tr class="{'' if r.get('include') else 'off'}">
 <td><input type="checkbox" name="inc_{i}" {'checked' if r.get('include') else ''}></td>
-<td class="t" style="white-space:nowrap"><input type="text" name="time_{i}" value="{t}" placeholder="mm:ss">{yt_link(state, r.get("start"))}</td>
+<td class="t" style="white-space:nowrap"><input type="text" name="time_{i}" value="{t}" placeholder="mm:ss">{PLAY_BTN}{yt_link(state, r.get("start"))}</td>
 <td><input type="text" name="artist_{i}" value="{html.escape(r['artist'] or '')}"></td>
 <td><input type="text" name="title_{i}" value="{html.escape(r['title'] or '')}">{heard_note}</td>
 <td class="hide-m"><small class="c-{level}">{html.escape(label)}</small></td></tr>""")
-    for i in range(len(rows), len(rows) + 3):  # blank rows to add songs that were missed
-        trs.append(f"""<tr><td><input type="checkbox" name="inc_{i}"></td>
-<td class="t"><input type="text" name="time_{i}" placeholder="mm:ss"></td>
-<td><input type="text" name="artist_{i}" placeholder="Add a missing song"></td>
-<td><input type="text" name="title_{i}" placeholder="Title"></td><td class="hide-m"></td></tr>""")
-    return rows, f"""<table><tr><th title="Save as its own song">Save</th><th>Starts at</th><th>Artist</th><th>Title</th>
-<th class="hide-m">How sure</th></tr>{''.join(trs)}</table>"""
+    trs += [blank_row(i) for i in range(len(rows), len(rows) + 3)]
+    return rows, f"""<table id="tracks"><tr><th title="Save as its own song">Save</th><th>Starts at</th><th>Artist</th><th>Title</th>
+<th class="hide-m">How sure</th></tr>{''.join(trs)}</table>
+<button type="button" class="secondary" style="font-size:13px;padding:6px 12px;margin-top:8px" onclick="addRow()">+ Add another song</button>"""
 
 
 def job_page(jid):
@@ -369,24 +439,38 @@ def job_page(jid):
         parts.append(f"""<div class="card"><h2>Check the tracklist</h2>
 <p class="muted">Ticked songs become separate files, cut where each one <i>starts</i>. Fix any names or times, untick anything
 that shouldn't be its own song (samples, short intros), or add a song Shazam missed. Times are where the song starts in the mix
-(press &#9654; to play the mix from that point and check). The first ticked song also gets any intro before it. {n_inc} of {len(state['rows'])} songs are ticked.</p>
+(press &#9654; to play the mix from that time right here - it uses whatever is typed in the box, so you can try a time
+before saving; &#8599; opens YouTube at that point). The first ticked song also gets any intro before it. {n_inc} of {len(state['rows'])} songs are ticked.</p>
 <p class="muted"><span class="c-ok">Confirmed</span> = Shazam heard it ·
 <span class="c-est">Estimated</span> = on the posted list but not heard, time guessed from the order ·
 <span class="c-warn">Heard once</span> = double-check it</p>
+<div class="player"><audio id="player" controls preload="none" src="/job/{jid}/audio"></audio></div>
 <form method="post" action="/job/{jid}/split">
 <div class="row"><div style="flex:2;min-width:220px"><label>Album</label>
 <input type="text" name="album" value="{html.escape(state.get('album') or '')}"></div>
 <div style="flex:1;min-width:160px"><label>Album artist (the DJ)</label>
 <input type="text" name="album_artist" value="{html.escape(state.get('album_artist') or '')}"></div></div>
 <label><input type="checkbox" name="full" {'checked' if job['opts'].get('full') else ''}> Also keep the full mix as one file</label>
+<label>Save songs as <select name="fmt"><option value="mp3">MP3 (320 kbps)</option>
+<option value="m4a" {'selected' if job['opts'].get('fmt') == 'm4a' else ''}>M4A (AAC 256 kbps)</option></select></label>
 <div style="overflow-x:auto;margin-top:8px">{table}</div>
 <div class="row" style="margin-top:12px"><button>Save these songs to my library</button></div></form>
 <form method="post" action="/job/{jid}/discard" style="margin-top:10px" onsubmit="return confirm('Discard this mix?')">
-<button class="danger" style="font-size:13px;padding:6px 12px">Discard</button></form></div>""")
+<button class="danger" style="font-size:13px;padding:6px 12px">Discard</button></form></div>{REVIEW_JS}""")
 
     if job["status"] == "done" and job.get("kind") != "selftest":
+        scan = job.get("scan")
+        note = ("A Navidrome library scan was started, so they should show up in a moment." if scan == "started"
+                else f"Could not start a Navidrome scan ({html.escape(scan)}) - start one from Navidrome's settings." if scan
+                else "Navidrome shows them after its next library scan (or start a scan from its settings).")
         parts.append(f"""<div class="card"><h2>Saved</h2><p>Songs are in <code>{html.escape(job.get('folder') or '')}</code>.
-Navidrome shows them after its next library scan (or start a scan from its settings).</p></div>""")
+{note}</p></div>""")
+
+    if job["status"] == "failed" and job.get("kind") != "selftest":
+        resume = ("The tracklist is already worked out - this takes you back to the review." if job_audio(jid) else
+                  "Picks up where it stopped: audio that was already downloaded and clips Shazam already answered are reused.")
+        parts.append(f"""<div class="card"><form method="post" action="/job/{jid}/retry"><button>Try again</button>
+<small class="muted"> {resume}</small></form></div>""")
 
     log = log_tail(job, 60 if job.get("kind") == "selftest" else 40)
     open_attr = "open" if job.get("kind") == "selftest" or job["status"] == "failed" else ""
@@ -426,12 +510,54 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Location", to)
         self.end_headers()
 
+    def send_audio(self, path):
+        """Serve the downloaded mix with byte-range support so the review page's player can jump to any time."""
+        if not path:
+            return self.send("Not found", "text/plain", 404)
+        size = path.stat().st_size
+        start, end = 0, size - 1
+        m = re.fullmatch(r"bytes=(\d*)-(\d*)", self.headers.get("Range", "").strip())
+        if m and (m.group(1) or m.group(2)):
+            if m.group(1):
+                start = int(m.group(1))
+                end = min(int(m.group(2)), size - 1) if m.group(2) else size - 1
+            else:  # "bytes=-N" = the last N bytes
+                start = max(0, size - int(m.group(2)))
+            if start > end or start >= size:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.end_headers()
+                return
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        else:
+            self.send_response(200)
+        self.send_header("Content-Type", AUDIO_TYPES.get(path.suffix.lower(), "application/octet-stream"))
+        self.send_header("Content-Length", str(end - start + 1))
+        self.send_header("Accept-Ranges", "bytes")
+        self.end_headers()
+        try:
+            with open(path, "rb") as f:
+                f.seek(start)
+                left = end - start + 1
+                while left > 0:
+                    chunk = f.read(min(256 * 1024, left))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    left -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # the browser stopped listening (seek / page closed)
+
     def do_GET(self):
         p = self.path.split("?")[0].rstrip("/") or "/"
         if p == "/":
             return self.send(home())
         if p == "/status":
             return self.send(json.dumps(status_json()), "application/json")
+        m = re.fullmatch(r"/job/(\d+)/audio", p)
+        if m:
+            return self.send_audio(job_audio(int(m.group(1))))
         m = re.fullmatch(r"/job/(\d+)(/status)?", p)
         if m:
             jid = int(m.group(1))
@@ -462,10 +588,12 @@ class H(BaseHTTPRequestHandler):
             save({"id": jid, "kind": "mix", "url": url, "status": "queued", "added": time.strftime("%b %d %H:%M"),
                   "opts": {"tracklist": form.get("tracklist", ""), "unordered": "unordered" in form,
                            "comments": "comments" in form, "full": "full" in form, "verify": "verify" in form,
+                           "step": 15 if "quick" in form else 30, "confirmed": "confirmed" in form,
+                           "fmt": "m4a" if form.get("fmt") == "m4a" else "mp3",
                            "auto": form.get("mode") == "auto"}})
             work.put((jid, "analyze"))
             return self.redirect(f"/job/{jid}")
-        m = re.fullmatch(r"/job/(\d+)/(split|discard)", p)
+        m = re.fullmatch(r"/job/(\d+)/(split|discard|retry)", p)
         if m:
             jid, action = int(m.group(1)), m.group(2)
             job = jobs.get(jid)
@@ -478,12 +606,27 @@ class H(BaseHTTPRequestHandler):
                     jobs.pop(jid, None)
                 shutil.rmtree(jdir(jid), ignore_errors=True)
                 return self.redirect("/")
+            if action == "retry":
+                if job["status"] != "failed" or job.get("kind") != "mix":
+                    return self.redirect(f"/job/{jid}")
+                job.pop("error", None)
+                job.pop("finished", None)
+                (jdir(jid) / "progress.json").unlink(missing_ok=True)
+                if job_audio(jid):  # analysis finished earlier; only the saving failed
+                    job["status"] = "review"
+                    save(job)
+                else:
+                    job["status"] = "queued"
+                    save(job)
+                    work.put((jid, "analyze"))
+                return self.redirect(f"/job/{jid}")
             if job["status"] != "review":
                 return self.redirect(f"/job/{jid}")
             state = read_json(jdir(jid) / "state.json", {})
             rows = sorted(state["rows"], key=lambda r: (r.get("start") is None, r.get("start") or 0))
             reviewed = []
-            for i in range(len(rows) + 3):
+            extra = [int(k[6:]) + 1 for k in form if re.fullmatch(r"title_\d{1,4}", k)]  # rows added on the page
+            for i in range(max([len(rows)] + extra)):
                 base = rows[i] if i < len(rows) else {"source": "added", "confidence": "edited", "shazam": "", "url": ""}
                 artist = form.get(f"artist_{i}", "").strip()
                 title = form.get(f"title_{i}", "").strip()
@@ -503,7 +646,7 @@ class H(BaseHTTPRequestHandler):
             (jdir(jid) / "reviewed.json").write_text(json.dumps(reviewed), encoding="utf-8")
             (jdir(jid) / "review_meta.json").write_text(json.dumps(
                 {"album": form.get("album", "").strip(), "album_artist": form.get("album_artist", "").strip(),
-                 "full": "full" in form}), encoding="utf-8")
+                 "full": "full" in form, "fmt": "m4a" if form.get("fmt") == "m4a" else "mp3"}), encoding="utf-8")
             (jdir(jid) / "progress.json").unlink(missing_ok=True)
             job["status"] = "splitting"
             save(job)

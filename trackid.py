@@ -226,7 +226,27 @@ def cut_clip(src, start, length, dst):
     )
 
 
-async def scan(audio, duration, step, clip_len, concurrency):
+def load_scan_cache(path, clip_len):
+    """Clip results saved by an earlier, interrupted scan of the same audio: {clip start: hit or None}."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        if data.get("clip") == clip_len:
+            return {int(k): v for k, v in data["clips"].items()}
+    except Exception:
+        pass
+    return {}
+
+
+def save_scan_cache(path, clip_len, clips):
+    tmp = str(path) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"clip": clip_len, "clips": clips}, f)
+    os.replace(tmp, path)
+
+
+async def scan(audio, duration, step, clip_len, concurrency, cache_path=None):
+    """Ask Shazam about one clip every `step` seconds. With cache_path, answers are saved as they arrive, so a
+    retry after a crash/restart only asks about the clips that are still missing."""
     from shazamio import Shazam
 
     shazam = Shazam()
@@ -235,50 +255,69 @@ async def scan(audio, duration, step, clip_len, concurrency):
     tmp = tempfile.mkdtemp(prefix="trackid_")
     starts = [t for t in range(0, int(duration - clip_len / 2), step)]
     hits, done = [], 0
+    cache = load_scan_cache(cache_path, clip_len) if cache_path else {}
+    if cache:
+        print(f"  reusing {sum(1 for t in starts if t in cache)} clips from an earlier scan", file=sys.stderr)
     seen = {}  # key -> (first time, "Artist - Title") for the live list
     started = time.time()
     progress("scan", 15, f"Listening to the mix: 0 of {len(starts)} clips", found=[])
 
-    async def one(t):
-        nonlocal done
+    async def ask(t):
+        """One clip -> hit dict, or None if Shazam heard nothing. Raises if Shazam couldn't be asked."""
         clip = os.path.join(tmp, f"{t}.wav")
-        async with sem:
-            await asyncio.to_thread(cut_clip, audio, t, clip_len, clip)
+        await asyncio.to_thread(cut_clip, audio, t, clip_len, clip)
+        try:
             for attempt in range(3):
                 try:
                     call = shazam.recognize(clip, proxy=proxy) if proxy else shazam.recognize(clip)
                     res = await asyncio.wait_for(call, timeout=25)  # never hang the whole job on one request
                     break
-                except Exception as e:  # rate limit / network blip / timeout
+                except Exception:  # rate limit / network blip / timeout
                     if attempt == 2:
-                        print(f"\n  ! {fmt_ts(t)} skipped: {type(e).__name__} {e}", file=sys.stderr)
-                        res = {}
+                        raise
                     await asyncio.sleep(3 * (attempt + 1))
             await asyncio.sleep(0.4)
+        finally:
+            os.remove(clip)
+        track = res.get("track")
+        if not track:
+            return None
+        offset = 0.0
+        if res.get("matches"):
+            offset = float(res["matches"][0].get("offset") or 0)
+        return {"t": t, "key": track.get("key"), "title": track.get("title", ""),
+                "artist": track.get("subtitle", ""), "offset": offset, "url": track.get("url", "")}
+
+    async def one(t):
+        nonlocal done
+        if t in cache:
+            hit = cache[t]
+        else:
+            async with sem:
+                try:
+                    hit = await ask(t)
+                    cache[t] = hit
+                except Exception as e:  # not cached, so a retry asks again
+                    print(f"\n  ! {fmt_ts(t)} skipped: {type(e).__name__} {e}", file=sys.stderr)
+                    hit = None
+            if cache_path and len(cache) % 10 == 0:
+                save_scan_cache(cache_path, clip_len, cache)
         done += 1
         print(f"\r  scanning {done}/{len(starts)} clips", end="", file=sys.stderr, flush=True)
-        os.remove(clip)
-        track = res.get("track")
-        if track and track.get("key") not in seen:
-            seen[track.get("key")] = (t, f'{track.get("subtitle", "")} - {track.get("title", "")}')
+        if hit and hit["key"] not in seen:
+            seen[hit["key"]] = (t, f'{hit["artist"]} - {hit["title"]}')
         found = [f"{fmt_ts(tt)}  {name}" for tt, name in sorted(seen.values())]
         progress("scan", 15 + 75 * done / len(starts),
                  f"Listening to the mix: clip {done} of {len(starts)} · {len(seen)} songs recognised so far"
                  + eta_text(started, done, len(starts)), found=found)
-        if not track:
-            return
-        offset = 0.0
-        if res.get("matches"):
-            offset = float(res["matches"][0].get("offset") or 0)
-        hits.append({
-            "t": t, "key": track.get("key"), "title": track.get("title", ""),
-            "artist": track.get("subtitle", ""), "offset": offset,
-            "url": track.get("url", ""),
-        })
+        if hit:
+            hits.append(hit)
 
     try:
         await asyncio.gather(*(one(t) for t in starts))
     finally:
+        if cache_path:
+            save_scan_cache(cache_path, clip_len, cache)
         await shazam.http_client.close()  # avoids "Unclosed client session" noise in logs
     print(file=sys.stderr)
     shutil.rmtree(tmp, ignore_errors=True)
@@ -468,7 +507,23 @@ def write_tracks(audio, segments, library, album, album_artist, year, source_url
             on_file(n - 1, f"{artist} - {r['title']}")
         subprocess.run(cmd + [str(dst)], check=True)
         written.append(dst)
+    remove_stale_tracks(folder, written)
     return folder, written
+
+
+def remove_stale_tracks(folder, written):
+    """After re-saving a mix, delete numbered song files left over from the previous save ("NN - Artist - Title")
+    that the new tracklist didn't write again. The optional full-mix file and anything else is left alone."""
+    keep = {p.name for p in written}
+    removed = []
+    for p in Path(folder).iterdir():
+        if (p.is_file() and p.name not in keep and "(Full Mix)" not in p.name
+                and re.fullmatch(r"\d{2,} - .+ - .+\.(mp3|m4a)", p.name)):
+            p.unlink()
+            removed.append(p.name)
+    if removed:
+        print(f"  removed {len(removed)} old file(s) from an earlier save: " + ", ".join(removed), file=sys.stderr)
+    return removed
 
 
 # --------------------------------------------------------------------------- pipeline
@@ -565,7 +620,7 @@ def analyze(source, state_dir, tracklist_text=None, unordered=False, comments=Fa
         rows = reconcile([], known, duration)
     else:
         log(f"Identifying songs (one {clip}s clip every {step}s)...")
-        hits = asyncio.run(scan(audio, duration, step, clip, concurrency))
+        hits = asyncio.run(scan(audio, duration, step, clip, concurrency, cache_path=state_dir / "scan_cache.json"))
         progress("match", 92, "Matching what was heard against the tracklist...")
         songs = merge_hits(hits, step)
         rank = {"low": 0, "medium": 1, "high": 2}
