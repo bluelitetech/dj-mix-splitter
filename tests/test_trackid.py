@@ -147,10 +147,105 @@ def test_scan_resumes_from_cache(tmp_path, monkeypatch):
     monkeypatch.delenv("HTTPS_PROXY", raising=False)
     monkeypatch.delenv("https_proxy", raising=False)
     cache = tmp_path / "scan_cache.json"
-    hits = asyncio.run(t.scan(str(mix), 120, 30, 12, 2, cache_path=cache))
+    hits = asyncio.run(t.scan(str(mix), 120, 30, 12, 2, cache_path=cache))["hits"]
     assert sorted(h["t"] for h in hits) == [0, 30, 90]
     assert sorted(set(asked)) == [0, 30, 60, 90]
     asked.clear()
-    hits = asyncio.run(t.scan(str(mix), 120, 30, 12, 2, cache_path=cache))
+    hits = asyncio.run(t.scan(str(mix), 120, 30, 12, 2, cache_path=cache))["hits"]
     assert sorted(h["t"] for h in hits) == [0, 30, 90]
     assert set(asked) == {60}  # only the clip that failed last time is asked again
+
+
+# ---- adaptive listening, against a pretend mix (no audio, no network)
+
+def fake_mix(monkeypatch, songs, duration, unknown=()):
+    """songs = [(start, name, drop_in)]: `name` plays from `start`; the DJ starts it `drop_in` seconds into the song.
+    The pretend Shazam names whatever is playing at the middle of each 12s clip. Returns the list of clips asked."""
+    import types
+    asked = []
+
+    def playing(sec):
+        cur = None
+        for start, name, drop in songs:
+            if start <= sec:
+                cur = (start, name, drop)
+        return cur
+
+    class FakeShazam:
+        def __init__(self):
+            async def close():
+                pass
+            self.http_client = types.SimpleNamespace(close=close)
+
+        async def recognize(self, clip, proxy=None):
+            start = int(Path(clip).stem)
+            asked.append(start)
+            cur = playing(start + 6)
+            if not cur or cur[1] in unknown:
+                return {}
+            return {"track": {"key": cur[1], "title": cur[1], "subtitle": "Artist " + cur[1]},
+                    "matches": [{"offset": max(0, start - cur[0] + cur[2])}]}
+
+    async def no_sleep(_):
+        pass
+
+    monkeypatch.setitem(sys.modules, "shazamio", types.SimpleNamespace(Shazam=FakeShazam))
+    monkeypatch.setattr(t.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(t, "cut_clip", lambda src, start, length, dst: Path(dst).write_bytes(b""))
+    monkeypatch.delenv("HTTPS_PROXY", raising=False)
+    monkeypatch.delenv("https_proxy", raising=False)
+    return asked
+
+
+def run_scan(duration, known=None, adaptive=True, step=30):
+    import asyncio
+    heard = asyncio.run(t.scan("mix", duration, step, 12, 4, known=known, adaptive=adaptive))
+    return {s["title"]: s for s in t.merge_hits(heard["hits"], step, heard["asked"], heard["implied"])}
+
+
+# starts are deliberately off the 30s grid; odd-numbered songs are dropped in 45s into the song
+MIX = [(0, "S0", 0), (171, "S1", 45), (403, "S2", 0), (538, "S3", 45), (791, "S4", 0), (1004, "S5", 45),
+       (1262, "S6", 0), (1377, "S7", 45), (1589, "S8", 0)]
+MIX_LEN = 1800
+
+
+def test_adaptive_scan_finds_start_times(monkeypatch):
+    asked = fake_mix(monkeypatch, MIX, MIX_LEN)
+    songs = run_scan(MIX_LEN)
+    assert sorted(songs) == sorted(name for _, name, _ in MIX)
+    for start, name, drop in MIX:
+        got = songs[name]["start"]
+        if drop == 0:
+            assert abs(got - start) <= 1, (name, got)        # played from the top: Shazam's offset gives it exactly
+        else:
+            assert start - 15 <= got <= start, (name, got)   # dropped in mid-song: a little early, never late
+    assert all(s["confidence"] == "high" for s in songs.values())
+    assert len(set(asked)) < MIX_LEN / 30  # fewer clips than asking about every one
+
+    # the old every-clip scan is up to a whole step early on the mid-song drop-ins
+    asked.clear()
+    old = run_scan(MIX_LEN, adaptive=False)
+    assert len(set(asked)) == MIX_LEN / 30
+    assert max(start - old[name]["start"] for start, name, drop in MIX if drop) > 20
+
+
+def test_adaptive_scan_with_tracklist_skips_the_gap_fill(monkeypatch):
+    asked = fake_mix(monkeypatch, MIX, MIX_LEN)
+    known = [{"artist": "Artist " + name, "title": name, "time": None, "order": i}
+             for i, (_, name, _) in enumerate(MIX)]
+    songs = run_scan(MIX_LEN, known=known)
+    with_list = len(set(asked))
+    for start, name, drop in MIX:
+        assert start - 15 <= songs[name]["start"] <= start + 1, (name, songs[name]["start"])
+    rows = t.reconcile(list(songs.values()), known, MIX_LEN)
+    assert all(r["source"] == "posted+shazam" for r in rows) and len(rows) == len(MIX)
+    assert with_list < MIX_LEN / 30
+
+
+def test_adaptive_scan_looks_harder_for_missing_posted_songs(monkeypatch):
+    # S3 is only 15s long and sits between two clips of the quick pass and the gap fill
+    mix = [(0, "S0", 0), (200, "S1", 0), (432, "S3", 0), (447, "S2", 0)]
+    asked = fake_mix(monkeypatch, mix, 700, unknown={"S1"})
+    known = [{"artist": "Artist " + n, "title": n, "time": None, "order": i} for i, n in enumerate(["S0", "S1", "S3", "S2"])]
+    songs = run_scan(700, known=known)
+    assert "S3" in songs and any(x % 30 for x in asked)
