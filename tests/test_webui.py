@@ -104,6 +104,35 @@ def test_retry_reanalyzes_or_returns_to_review(ui):
     assert ui.queued == [] and ui.jobs[1]["status"] == "review"
 
 
+def test_review_again_restores_the_last_saved_tracklist(ui):
+    d = make_job(ui, status="done")
+    (d / "abc.webm").unlink()  # the audio is deleted after saving
+    reviewed = [{"artist": "A", "title": "One (fixed)", "start": 0, "include": True, "source": "shazam",
+                 "confidence": "edited"},
+                {"artist": "B", "title": "Two", "start": 185, "include": True, "source": "shazam", "confidence": "edited"}]
+    (d / "reviewed.json").write_text(json.dumps(reviewed))
+    (d / "review_meta.json").write_text(json.dumps({"album": "My Mix", "album_artist": "DJ X", "full": False}))
+    assert "Review again" in get(ui, "/job/1").read().decode()
+    post(ui, "/job/1/reopen")
+    assert ui.queued == [(1, "reopen")] and ui.jobs[1]["status"] == "queued" and ui.jobs[1]["reopening"]
+    # what the worker does once the audio is back
+    (d / "abc.webm").write_bytes(b"audio")
+    ui.apply_last_review(1)
+    state = json.loads((d / "state.json").read_text())
+    assert [(r["title"], r["start"], r["label"]) for r in state["rows"]] == [
+        ("One (fixed)", 0, "Edited by you"), ("Two", 185, "Edited by you")]
+    assert (state["album"], state["album_artist"]) == ("My Mix", "DJ X")
+    ui.jobs[1]["status"] = "review"
+    page = get(ui, "/job/1").read().decode()
+    assert 'value="One (fixed)"' in page and 'value="03:05"' in page and 'value="My Mix"' in page
+
+
+def test_review_again_is_only_for_saved_mixes(ui):
+    make_job(ui, status="review")
+    post(ui, "/job/1/reopen")
+    assert ui.queued == [] and ui.jobs[1]["status"] == "review"
+
+
 def test_navidrome_scan(ui, monkeypatch):
     seen = {}
 

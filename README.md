@@ -38,6 +38,10 @@ Reviews are kept in `/data`, so they survive a container restart. Use **Run self
 already downloaded and the clips Shazam already answered are reused; if only the saving failed you go
 straight back to the review.
 
+**Saved something wrong?** Open the saved mix and press **Review again**. The mix is downloaded again
+(Shazam isn't asked again) and the review reopens with the tracklist as you last saved it. Pressing Enter
+in a text box never saves; only the **Save** button does.
+
 **Saving the same mix again** replaces the album: numbered song files from the earlier save that aren't in
 the new tracklist are deleted from that album folder (the full-mix file and everything else is left alone).
 

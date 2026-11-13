@@ -39,7 +39,7 @@ AUDIO_TYPES = {".webm": "audio/webm", ".m4a": "audio/mp4", ".mp4": "audio/mp4", 
 JOBS.mkdir(parents=True, exist_ok=True)
 
 sys.path.insert(0, str(HERE))
-from trackid import fmt_ts, parse_ts  # noqa: E402
+from trackid import fmt_ts, friendly_confidence, parse_ts  # noqa: E402
 
 lock = threading.Lock()
 work = queue.Queue()
@@ -141,6 +141,22 @@ def job_audio(jid):
     return None
 
 
+def apply_last_review(jid):
+    """Put the tracklist as it was last saved from the review page (reviewed.json) back into state.json, so the
+    review opens with those edits instead of the original analysis."""
+    d = jdir(jid)
+    state, reviewed = read_json(d / "state.json"), read_json(d / "reviewed.json")
+    if not state or not reviewed:
+        return
+    for r in reviewed:
+        r["level"], r["label"] = friendly_confidence(r)
+    meta = read_json(d / "review_meta.json", {}) or {}
+    state["rows"] = reviewed
+    state["album"] = meta.get("album") or state.get("album")
+    state["album_artist"] = meta.get("album_artist") or state.get("album_artist")
+    (d / "state.json").write_text(json.dumps(state, indent=1), encoding="utf-8")
+
+
 def worker():
     while True:
         jid, action = work.get()
@@ -183,6 +199,16 @@ def worker():
                         work.put((jid, "split"))
                         continue
                     job["status"] = "review"
+            elif action == "reopen":
+                job["status"] = "analyzing"
+                save(job)
+                rc = run(job, [str(HERE / "trackid.py"), "--redownload", str(d)])
+                if rc != 0:
+                    job.update(status="failed", error=last_error(job))
+                else:
+                    apply_last_review(jid)
+                    job["status"] = "review"
+                    job.pop("reopening", None)
             elif action == "split":
                 job["status"] = "splitting"
                 save(job)
@@ -397,6 +423,9 @@ if(p.readyState>0)go();else{p.addEventListener('loadedmetadata',go,{once:true});
 function addRow(){const t=document.getElementById('tracks'),i=t.querySelectorAll('input[name^=title_]').length;
 t.tBodies[0].insertAdjacentHTML('beforeend',%s.replace(/__I__/g,i));
 t.querySelector('input[name=time_'+i+']').focus()}
+// Enter in a text box must not save the whole form by accident; only the Save button does.
+document.querySelectorAll('form[action$="/split"]').forEach(f=>f.addEventListener('keydown',e=>{
+if(e.key==='Enter'&&e.target.tagName==='INPUT'&&e.target.type!=='checkbox')e.preventDefault()}));
 // Drag a song by its handle onto another row: the songs in between shift along, the start times and ticks stay put.
 (function(){const t=document.getElementById('tracks');let from=null,over=null;
 const rows=()=>Array.from(t.tBodies[0].rows).filter(r=>r.querySelector('td.song'));
@@ -450,7 +479,7 @@ def job_page(jid):
 <div id="txt-{jid}">{html.escape(status_text(job, prog))}</div>
 {f'<p class="muted">{html.escape(prog["posted"])}</p>' if prog.get('posted') else ''}</div>"""]
 
-    if job["status"] in ("analyzing", "queued") and job.get("kind") != "selftest":
+    if job["status"] in ("analyzing", "queued") and job.get("kind") != "selftest" and not job.get("reopening"):
         parts.append(f'<div class="card"><h2>Songs recognised so far</h2><div id="found-{jid}">{found_html(prog)}</div></div>')
 
     if job["status"] == "review":
@@ -486,10 +515,14 @@ before saving; &#8599; opens YouTube at that point). The first ticked song also 
                 else f"Could not start a Navidrome scan ({html.escape(scan)}) - start one from Navidrome's settings." if scan
                 else "Navidrome shows them after its next library scan (or start a scan from its settings).")
         parts.append(f"""<div class="card"><h2>Saved</h2><p>Songs are in <code>{html.escape(job.get('folder') or '')}</code>.
-{note}</p></div>""")
+{note}</p>
+<form method="post" action="/job/{jid}/reopen"><button class="secondary">Review again</button>
+<small class="muted"> Something wrong? This downloads the mix again (no listening) and reopens the review with your last
+tracklist filled in. Saving with the same album names replaces the songs in that folder.</small></form></div>""")
 
     if job["status"] == "failed" and job.get("kind") != "selftest":
-        resume = ("The tracklist is already worked out - this takes you back to the review." if job_audio(jid) else
+        resume = ("The tracklist is already worked out - this takes you back to the review with your last edits."
+                  if job_audio(jid) or job.get("reopening") else
                   "Picks up where it stopped: audio that was already downloaded and clips Shazam already answered are reused.")
         parts.append(f"""<div class="card"><form method="post" action="/job/{jid}/retry"><button>Try again</button>
 <small class="muted"> {resume}</small></form></div>""")
@@ -615,7 +648,7 @@ class H(BaseHTTPRequestHandler):
                            "auto": form.get("mode") == "auto"}})
             work.put((jid, "analyze"))
             return self.redirect(f"/job/{jid}")
-        m = re.fullmatch(r"/job/(\d+)/(split|discard|retry)", p)
+        m = re.fullmatch(r"/job/(\d+)/(split|discard|retry|reopen)", p)
         if m:
             jid, action = int(m.group(1)), m.group(2)
             job = jobs.get(jid)
@@ -628,6 +661,15 @@ class H(BaseHTTPRequestHandler):
                     jobs.pop(jid, None)
                 shutil.rmtree(jdir(jid), ignore_errors=True)
                 return self.redirect("/")
+            if action == "reopen":
+                if job["status"] != "done" or job.get("kind") != "mix" or not (jdir(jid) / "state.json").exists():
+                    return self.redirect(f"/job/{jid}")
+                (jdir(jid) / "progress.json").unlink(missing_ok=True)
+                job.pop("finished", None)
+                job.update(status="queued", reopening=True)
+                save(job)
+                work.put((jid, "reopen"))
+                return self.redirect(f"/job/{jid}")
             if action == "retry":
                 if job["status"] != "failed" or job.get("kind") != "mix":
                     return self.redirect(f"/job/{jid}")
@@ -635,8 +677,14 @@ class H(BaseHTTPRequestHandler):
                 job.pop("finished", None)
                 (jdir(jid) / "progress.json").unlink(missing_ok=True)
                 if job_audio(jid):  # analysis finished earlier; only the saving failed
+                    apply_last_review(jid)
                     job["status"] = "review"
+                    job.pop("reopening", None)
                     save(job)
+                elif job.get("reopening"):  # the download for "Review again" was interrupted
+                    job["status"] = "queued"
+                    save(job)
+                    work.put((jid, "reopen"))
                 else:
                     job["status"] = "queued"
                     save(job)
