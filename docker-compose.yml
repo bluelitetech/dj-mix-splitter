@@ -1,5 +1,5 @@
 # Paste this into your NAS's Docker "Project / Compose" screen.
-# Change the ONE line marked CHANGE ME to the folder Navidrome uses for music.
+# Set up for the UGREEN NAS: music goes into the same folder Navidrome reads.
 services:
   mix-splitter:
     image: ghcr.io/bluelitetech/dj-mix-splitter:latest
@@ -8,7 +8,7 @@ services:
     ports:
       - "8765:8765"
     volumes:
-      - /volume1/Music:/music              # CHANGE ME: same host folder Navidrome mounts as /music
+      - /volume2/arr-library/media/music:/music   # same folder Navidrome reads (Navidrome can stay :ro; this needs write)
       - mix-splitter-data:/data            # job logs + reports (+ cookies.txt if ever needed)
     environment:
       - MUSIC_LIBRARY=/music/DJ Mixes      # songs land in <music>/DJ Mixes/<DJ>/<Mix>/
