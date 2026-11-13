@@ -768,6 +768,25 @@ def analyze(source, state_dir, tracklist_text=None, unordered=False, comments=Fa
     return state
 
 
+def redownload(state_dir):
+    """Fetch the audio of an already analysed mix again (it is deleted after saving) so it can be reviewed and
+    saved a second time. The tracklist in state.json is kept; nothing is listened to again."""
+    state_dir = Path(state_dir)
+    state = json.loads((state_dir / "state.json").read_text(encoding="utf-8"))
+    if not Path(state["audio"]).is_file():
+        if not is_url(state["source"]):
+            sys.exit(f"The audio file is gone and can't be downloaded again: {state['audio']}")
+        log("Downloading the audio again...")
+        progress("download", 5, "Downloading the mix audio again...")
+        state["audio"] = yt_audio(state["source"], state_dir, 5, 98)
+        state["duration"] = audio_duration(state["audio"])
+        (state_dir / "state.json").write_text(json.dumps(state, indent=1), encoding="utf-8")
+    summary = "The mix is downloaded again and your last tracklist is filled in"
+    progress("analyzed", 100, summary, summary=summary)
+    log(summary)
+    return state
+
+
 def split(state_dir, library, rows=None, album=None, album_artist=None, fmt="mp3", keep_full_mix=False,
           delete_audio=True):
     """Cut the analysed mix into tagged songs. `rows` = reviewed list (with include/start); default = as analysed."""
@@ -885,6 +904,8 @@ def main():
     ap.add_argument("--analyze-only", metavar="JOB_DIR",
                     help="identify songs and save the result + audio in JOB_DIR for review; don't split")
     ap.add_argument("--split-job", metavar="JOB_DIR", help="split a previously analysed JOB_DIR into --library")
+    ap.add_argument("--redownload", metavar="JOB_DIR",
+                    help="download the audio of an analysed JOB_DIR again (to review and save it a second time)")
     ap.add_argument("--rows", help="with --split-job: JSON file with the reviewed rows (include/start/artist/title)")
     a = ap.parse_args()
 
@@ -898,6 +919,8 @@ def main():
         rows = json.loads(Path(a.rows).read_text(encoding="utf-8")) if a.rows else None
         split(a.split_job, a.library, rows=rows, album=a.album, album_artist=a.album_artist,
               fmt=a.format, keep_full_mix=a.keep_full_mix)
+    elif a.redownload:
+        redownload(a.redownload)
     elif not a.source:
         ap.error("give a YouTube URL or audio file")
     elif a.analyze_only:
