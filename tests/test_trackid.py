@@ -87,3 +87,16 @@ def test_write_tracks(tmp_path):
 def test_clean_title():
     assert t.clean_mix_title("Throwbacks Only (Vol 2) || Dirty South Hip-Hop Mix || Lil Jon, Juvenile") == \
         "Throwbacks Only (Vol 2) - Dirty South Hip-Hop Mix"
+
+
+def test_segments_from_reviewed_rows():
+    rows = [{"title": "A", "start": 100, "include": True}, {"title": "B", "start": 200, "include": False},
+            {"title": "C", "start": 300, "include": True}, {"title": "D", "start": None, "include": True}]
+    segs = t.segments_from_rows(rows, 400)
+    assert [(a, b, r["title"]) for a, b, r in segs] == [(0, 300, "A"), (300, 400, "C")]
+
+
+def test_friendly_labels():
+    assert t.friendly_confidence({"confidence": "estimated (~)"})[0] == "est"
+    assert t.friendly_confidence({"confidence": "high", "source": "posted+shazam", "hits": 4})[1].startswith("Confirmed")
+    assert t.friendly_confidence({"confidence": "low (not on posted list)"})[0] == "warn"

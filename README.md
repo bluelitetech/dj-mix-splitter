@@ -19,7 +19,15 @@ Copy this folder to the server and set the music path in `docker-compose.yml` (i
 ```bash
 docker compose up -d --build
 ```
-Open `http://<server-ip>:8765`, paste a link and press **Split it**. The page shows progress, and Navidrome picks the album up on its next scan. To have it show up straight away, run a scan from Navidrome's UI (Settings → Library scan) or lower `ND_SCANSCHEDULE`.
+Open `http://<server-ip>:8765` (or your Cloudflare URL), paste a link and choose:
+
+- **Find the songs (review before saving)**: recommended. A progress bar shows each step (read video → download →
+  listen → review → save), and songs appear in a list as Shazam recognises them. When it finishes you get an
+  editable tracklist: fix names or start times, untick samples or intros, add a song that was missed, and press
+  ▶ to play the mix from any song's start to check it. Nothing touches your library until you press **Save**.
+- **Find + save straight away**: same thing with no review step.
+
+Reviews are kept in `/data`, so they survive a container restart. Use **Run self-test** to check the setup.
 
 ## Option B: command line
 Requires Python 3.10+, ffmpeg and deno.

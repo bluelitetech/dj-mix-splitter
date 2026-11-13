@@ -33,6 +33,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import time
 import unicodedata
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -125,6 +126,31 @@ def parse_tracklist(text):
     return tracks if len(tracks) >= 3 else []
 
 
+# --------------------------------------------------------------------------- progress (read by the web page)
+
+_progress = {}
+
+
+def progress(stage, pct, text, **extra):
+    """Write a small JSON status file if PROGRESS_FILE is set (the web page shows it as a progress bar)."""
+    _progress.update(extra)
+    _progress.update(stage=stage, pct=round(max(0, min(100, pct)), 1), text=text, updated=time.time())
+    path = os.environ.get("PROGRESS_FILE")
+    if not path:
+        return
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(_progress, f)
+    os.replace(tmp, path)
+
+
+def eta_text(started, done, total):
+    if done < 3:
+        return ""
+    left = (time.time() - started) / done * (total - done)
+    return f" · about {max(1, round(left / 60))} min left" if left >= 60 else " · less than a minute left"
+
+
 # --------------------------------------------------------------------------- youtube
 
 def is_url(s):
@@ -161,14 +187,23 @@ def yt_comments(url, limit=60):
     return [c.get("text", "") for c in json.loads(out.stdout).get("comments") or []]
 
 
-def yt_audio(url, workdir):
+def yt_audio(url, workdir, pct_from=5, pct_to=15):
     tmpl = str(Path(workdir) / "%(id)s.%(ext)s")
-    out = subprocess.run(
-        ytdlp() + ["-f", "bestaudio/best", "-o", tmpl, "--no-playlist", "--no-warnings", url],
-        capture_output=True, text=True,
+    proc = subprocess.Popen(
+        ytdlp() + ["-f", "bestaudio/best", "-o", tmpl, "--no-playlist", "--no-warnings", "--newline", url],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
-    if out.returncode != 0:
-        sys.exit(f"yt-dlp could not download the audio:\n{out.stderr[-1500:]}")
+    tail, last = [], -1
+    for line in proc.stdout:
+        tail = (tail + [line])[-30:]
+        m = re.search(r"\[download\]\s+([\d.]+)%(?:\s+of\s+~?\s*([\d.]+\w+))?", line)
+        if m and int(float(m.group(1))) != last:
+            last = int(float(m.group(1)))
+            size = f" of {m.group(2)}" if m.group(2) else ""
+            progress("download", pct_from + (pct_to - pct_from) * last / 100,
+                     f"Downloading the mix audio: {last}%{size}")
+    if proc.wait() != 0:
+        sys.exit("yt-dlp could not download the audio:\n" + "".join(tail)[-1500:])
     files = [p for p in Path(workdir).iterdir() if not p.name.endswith((".part", ".json"))]
     return str(max(files, key=lambda p: p.stat().st_size))
 
@@ -200,19 +235,23 @@ async def scan(audio, duration, step, clip_len, concurrency):
     tmp = tempfile.mkdtemp(prefix="trackid_")
     starts = [t for t in range(0, int(duration - clip_len / 2), step)]
     hits, done = [], 0
+    seen = {}  # key -> (first time, "Artist - Title") for the live list
+    started = time.time()
+    progress("scan", 15, f"Listening to the mix: 0 of {len(starts)} clips", found=[])
 
     async def one(t):
         nonlocal done
         clip = os.path.join(tmp, f"{t}.wav")
-        await asyncio.to_thread(cut_clip, audio, t, clip_len, clip)
         async with sem:
+            await asyncio.to_thread(cut_clip, audio, t, clip_len, clip)
             for attempt in range(3):
                 try:
-                    res = await shazam.recognize(clip, proxy=proxy) if proxy else await shazam.recognize(clip)
+                    call = shazam.recognize(clip, proxy=proxy) if proxy else shazam.recognize(clip)
+                    res = await asyncio.wait_for(call, timeout=25)  # never hang the whole job on one request
                     break
-                except Exception as e:  # rate limit / network blip
+                except Exception as e:  # rate limit / network blip / timeout
                     if attempt == 2:
-                        print(f"\n  ! {fmt_ts(t)} failed: {e}", file=sys.stderr)
+                        print(f"\n  ! {fmt_ts(t)} skipped: {type(e).__name__} {e}", file=sys.stderr)
                         res = {}
                     await asyncio.sleep(3 * (attempt + 1))
             await asyncio.sleep(0.4)
@@ -220,6 +259,12 @@ async def scan(audio, duration, step, clip_len, concurrency):
         print(f"\r  scanning {done}/{len(starts)} clips", end="", file=sys.stderr, flush=True)
         os.remove(clip)
         track = res.get("track")
+        if track and track.get("key") not in seen:
+            seen[track.get("key")] = (t, f'{track.get("subtitle", "")} - {track.get("title", "")}')
+        found = [f"{fmt_ts(tt)}  {name}" for tt, name in sorted(seen.values())]
+        progress("scan", 15 + 75 * done / len(starts),
+                 f"Listening to the mix: clip {done} of {len(starts)} · {len(seen)} songs recognised so far"
+                 + eta_text(started, done, len(starts)), found=found)
         if not track:
             return
         offset = 0.0
@@ -388,7 +433,8 @@ def fetch_cover(info, dest):
         return None
 
 
-def write_tracks(audio, segments, library, album, album_artist, year, source_url, cover, fmt="mp3"):
+def write_tracks(audio, segments, library, album, album_artist, year, source_url, cover, fmt="mp3",
+                 on_file=None):
     folder = Path(library) / safe_name(album_artist) / safe_name(album)
     folder.mkdir(parents=True, exist_ok=True)
     if cover:
@@ -418,86 +464,183 @@ def write_tracks(audio, segments, library, album, album_artist, year, source_url
             tags["date"] = str(year)
         for k, v in tags.items():
             cmd += ["-metadata", f"{k}={v}"]
+        if on_file:
+            on_file(n - 1, f"{artist} - {r['title']}")
         subprocess.run(cmd + [str(dst)], check=True)
         written.append(dst)
     return folder, written
 
 
 # --------------------------------------------------------------------------- pipeline
+#   analyze()  ->  state.json (+ cached audio) in a job folder   -> review / edit
+#   split()    ->  tagged files in the music library
 
 def log(msg):
     print(msg, file=sys.stderr, flush=True)
 
 
-def process(source, out="output", library=None, tracklist_text=None, unordered=False, comments=False,
-            step=30, clip=12, concurrency=3, min_confidence="low", include_estimated=True,
-            fmt="mp3", keep_full_mix=False, album=None, album_artist=None):
-    """Full run. Returns dict with rows, files and folder. Used by the CLI and the web page."""
-    outdir = Path(out)
-    outdir.mkdir(parents=True, exist_ok=True)
+def friendly_confidence(r):
+    """Plain-English label for the review table."""
+    c, src, hits = r.get("confidence", ""), r.get("source", ""), r.get("hits", 0)
+    if c.startswith("est"):
+        return ("est", "Estimated from the posted order")
+    if c == "not detected":
+        return ("miss", "Not heard - add a time to include it")
+    if c == "posted timestamp":
+        return ("posted", "Time from the posted tracklist")
+    if c == "edited":
+        return ("ok", "Edited by you")
+    if "not on posted list" in c:
+        return ("warn", "Heard once, not on posted list (probably a sample)")
+    if c == "low":
+        return ("warn", "Heard once - check it")
+    return ("ok", f"Confirmed - heard {hits}x" + (" + on posted list" if "posted" in src else ""))
+
+
+def segments_from_rows(rows, duration):
+    """Cut points exactly as given (used after the user reviewed/edited the list)."""
+    chosen = sorted((r for r in rows if r.get("include") and r.get("start") is not None), key=lambda r: r["start"])
+    out = []
+    for i, r in enumerate(chosen):
+        start = 0 if i == 0 else r["start"]
+        end = chosen[i + 1]["start"] if i + 1 < len(chosen) else duration
+        if end > start:
+            out.append((start, end, r))
+    return out
+
+
+def analyze(source, state_dir, tracklist_text=None, unordered=False, comments=False, step=30, clip=12,
+            concurrency=3, min_confidence="low", include_estimated=True):
+    """Find the songs and save everything needed to split later into state_dir/state.json."""
+    state_dir = Path(state_dir)
+    state_dir.mkdir(parents=True, exist_ok=True)
     known, label, info = [], "mix", {}
-    workdir = tempfile.mkdtemp(prefix="trackid_dl_")
-    try:
-        if is_url(source):
-            log("Reading video info...")
-            info = yt_info(source)
-            label = info.get("id", "mix")
-            log(f"  {info.get('title')}  [{info.get('duration_string')}]")
-            if info.get("chapters"):
-                known = [{**dict(zip(("artist", "title"), split_artist_title(c["title"]))),
-                          "time": c["start_time"], "order": i} for i, c in enumerate(info["chapters"])]
-                log(f"  found {len(known)} chapters")
-            if not known:
-                known = parse_tracklist(info.get("description") or "")
+    progress("info", 1, "Reading the video's details...")
+    if is_url(source):
+        log("Reading video info...")
+        info = yt_info(source)
+        label = info.get("id", "mix")
+        log(f"  {info.get('title')}  [{info.get('duration_string')}]")
+        if info.get("chapters"):
+            known = [{**dict(zip(("artist", "title"), split_artist_title(c["title"]))),
+                      "time": c["start_time"], "order": i} for i, c in enumerate(info["chapters"])]
+            log(f"  found {len(known)} chapters")
+        if not known:
+            known = parse_tracklist(info.get("description") or "")
+            if known:
+                log(f"  found a {len(known)}-track list in the description "
+                    f"({'with' if any(k['time'] is not None for k in known) else 'no'} timestamps)")
+        if not known and comments:
+            progress("info", 3, "Looking for a tracklist in the comments...")
+            log("  checking comments...")
+            for c in yt_comments(source):
+                known = parse_tracklist(c)
                 if known:
-                    log(f"  found a {len(known)}-track list in the description "
-                        f"({'with' if any(k['time'] is not None for k in known) else 'no'} timestamps)")
-            if not known and comments:
-                log("  checking comments...")
-                for c in yt_comments(source):
-                    known = parse_tracklist(c)
-                    if known:
-                        log(f"  found a {len(known)}-track list in a comment")
-                        break
-            log("Downloading audio...")
-            audio = yt_audio(source, workdir)
-        else:
-            audio = source
-            label = Path(audio).stem
-        if tracklist_text:
-            known = parse_tracklist(tracklist_text) or known
-            log(f"  using {len(known)} tracks from the supplied tracklist")
+                    log(f"  found a {len(known)}-track list in a comment")
+                    break
+    if tracklist_text:
+        known = parse_tracklist(tracklist_text) or known
+        log(f"  using {len(known)} tracks from the supplied tracklist")
 
-        duration = audio_duration(audio)
-        log(f"Identifying songs (one {clip}s clip every {step}s)...")
-        hits = asyncio.run(scan(audio, duration, step, clip, concurrency))
-        songs = merge_hits(hits, step)
-        rank = {"low": 0, "medium": 1, "high": 2}
-        songs = [s for s in songs if rank[s["confidence"]] >= rank[min_confidence]]
-        rows = reconcile(songs, known, duration, posted_order_is_reliable=not unordered)
+    timed = any(k["time"] is not None for k in known)
+    posted = (f"Tracklist found: {len(known)} songs" + (" with timestamps" if timed else " (no timestamps)")
+              if known else "No tracklist found - identifying everything from the audio")
+    progress("info", 5, posted, title=info.get("title") or label, posted=posted,
+             posted_list=[f'{k["artist"]} - {k["title"]}' if k["artist"] else k["title"] for k in known])
 
-        csv_path, chap_path = write_reports(rows, outdir, label)
-        print_table(rows, known)
-        result = {"rows": rows, "csv": csv_path, "chapters": chap_path, "folder": None, "files": []}
+    if is_url(source):
+        log("Downloading audio...")
+        progress("download", 5, "Downloading the mix audio...")
+        audio = yt_audio(source, state_dir)
+    else:
+        audio = source
+        label = Path(audio).stem
 
+    duration = audio_duration(audio)
+    log(f"Identifying songs (one {clip}s clip every {step}s)...")
+    hits = asyncio.run(scan(audio, duration, step, clip, concurrency))
+    progress("match", 92, "Matching what was heard against the tracklist...")
+    songs = merge_hits(hits, step)
+    rank = {"low": 0, "medium": 1, "high": 2}
+    songs = [s for s in songs if rank[s["confidence"]] >= rank[min_confidence]]
+    rows = reconcile(songs, known, duration, posted_order_is_reliable=not unordered)
+
+    cut = {id(r) for _, _, r in split_points(rows, duration, include_estimated=include_estimated)}
+    for r in rows:
+        r["include"] = id(r) in cut
+        r["level"], r["label"] = friendly_confidence(r)
+
+    write_reports(rows, state_dir, label)
+    print_table(rows, known)
+    state = {
+        "source": source, "label": label, "duration": duration, "audio": str(audio), "rows": rows,
+        "known_count": len(known), "known_timed": timed,
+        "info": {k: info.get(k) for k in ("id", "title", "channel", "uploader", "upload_date", "webpage_url", "thumbnail")},
+        "album": clean_mix_title(info.get("title") or label),
+        "album_artist": info.get("channel") or info.get("uploader") or "Various DJs",
+        "year": (info.get("upload_date") or "")[:4] or None,
+    }
+    (state_dir / "state.json").write_text(json.dumps(state, indent=1), encoding="utf-8")
+    heard = sum(1 for r in rows if "shazam" in r["source"])
+    summary = (f"Found {len(rows)} songs: {heard} recognised from the audio"
+               + (f", {sum(1 for r in rows if r['source'] == 'posted')} placed from the posted tracklist" if known else ""))
+    progress("analyzed", 100, summary, summary=summary)
+    log(summary)
+    return state
+
+
+def split(state_dir, library, rows=None, album=None, album_artist=None, fmt="mp3", keep_full_mix=False,
+          delete_audio=True):
+    """Cut the analysed mix into tagged songs. `rows` = reviewed list (with include/start); default = as analysed."""
+    state_dir = Path(state_dir)
+    state = json.loads((state_dir / "state.json").read_text(encoding="utf-8"))
+    rows = rows if rows is not None else state["rows"]
+    segments = segments_from_rows(rows, state["duration"])
+    if not segments:
+        sys.exit("Nothing to split: no songs are ticked.")
+    album = album or state["album"]
+    album_artist = album_artist or state["album_artist"]
+    info = state["info"]
+    audio = state["audio"]
+    log(f"Writing {len(segments)} tracks to the library...")
+    progress("split", 2, "Getting the cover art...")
+    cover = fetch_cover(info, state_dir / "cover.jpg") if info.get("thumbnail") else None
+    total = len(segments)
+
+    def on_file(n, name):
+        progress("split", 5 + 90 * n / total, f"Saving songs to your library: {n} of {total} · {name}")
+
+    folder, files = write_tracks(audio, segments, library, album, album_artist, state.get("year"),
+                                 info.get("webpage_url"), cover, fmt, on_file=on_file)
+    write_reports(rows, folder, "tracklist")
+    (folder / "tracklist_tracklist.csv").replace(folder / "tracklist.csv")
+    (folder / "tracklist_chapters.txt").replace(folder / "chapters.txt")
+    if keep_full_mix:
+        progress("split", 97, "Copying the full mix...")
+        shutil.copy(audio, folder / f"00 - {safe_name(album)} (Full Mix){Path(audio).suffix}")
+    if delete_audio and Path(audio).parent == state_dir:
+        Path(audio).unlink(missing_ok=True)
+    progress("done", 100, f"Done - {total} songs saved to {folder}", folder=str(folder))
+    log(f"Done: {folder}")
+    return folder, files
+
+
+def process(source, out="output", library=None, include_estimated=True, fmt="mp3", keep_full_mix=False,
+            album=None, album_artist=None, **analyze_args):
+    """Analyze and (if library is given) split straight away."""
+    state_dir = Path(tempfile.mkdtemp(prefix="trackid_job_"))
+    try:
+        state = analyze(source, state_dir, include_estimated=include_estimated, **analyze_args)
+        Path(out).mkdir(parents=True, exist_ok=True)
+        for f in state_dir.glob("*_tracklist.csv"):
+            shutil.copy(f, Path(out) / f.name)
+        for f in state_dir.glob("*_chapters.txt"):
+            shutil.copy(f, Path(out) / f.name)
         if library:
-            album = album or clean_mix_title(info.get("title") or label)
-            album_artist = album_artist or info.get("channel") or info.get("uploader") or "Various DJs"
-            year = (info.get("upload_date") or "")[:4] or None
-            segments = split_points(rows, duration, include_estimated=include_estimated)
-            log(f"Writing {len(segments)} tracks to the library...")
-            cover = fetch_cover(info, Path(workdir) / "cover.jpg") if info else None
-            folder, files = write_tracks(audio, segments, library, album, album_artist, year,
-                                         info.get("webpage_url") if info else None, cover, fmt)
-            shutil.copy(csv_path, folder / "tracklist.csv")
-            if keep_full_mix:
-                full = folder / f"00 - {safe_name(album)} (Full Mix){Path(audio).suffix}"
-                shutil.copy(audio, full)
-            result.update(folder=folder, files=files)
-            log(f"Done: {folder}")
-        return result
+            split(state_dir, library, album=album, album_artist=album_artist, fmt=fmt, keep_full_mix=keep_full_mix)
+        return state
     finally:
-        shutil.rmtree(workdir, ignore_errors=True)
+        shutil.rmtree(state_dir, ignore_errors=True)
 
 
 def write_reports(rows, outdir, label):
@@ -537,7 +680,7 @@ def print_table(rows, known):
 
 def main():
     ap = argparse.ArgumentParser(description="Identify the tracklist of a DJ mix and (optionally) split it into tagged songs.")
-    ap.add_argument("source", help="YouTube URL or local audio file")
+    ap.add_argument("source", nargs="?", help="YouTube URL or local audio file")
     ap.add_argument("--library", default=os.environ.get("MUSIC_LIBRARY"),
                     help="music library folder (e.g. your Navidrome /music). If set, the mix is split into tagged "
                          "songs at <library>/<DJ>/<Mix title>/. Env: MUSIC_LIBRARY")
@@ -555,12 +698,28 @@ def main():
     ap.add_argument("--concurrency", type=int, default=3, help="parallel Shazam requests (default 3)")
     ap.add_argument("--min-confidence", choices=["low", "medium", "high"], default="low")
     ap.add_argument("--out", default="output", help="folder for the CSV/chapters reports (default ./output)")
+    ap.add_argument("--analyze-only", metavar="JOB_DIR",
+                    help="identify songs and save the result + audio in JOB_DIR for review; don't split")
+    ap.add_argument("--split-job", metavar="JOB_DIR", help="split a previously analysed JOB_DIR into --library")
+    ap.add_argument("--rows", help="with --split-job: JSON file with the reviewed rows (include/start/artist/title)")
     a = ap.parse_args()
-    process(a.source, out=a.out, library=a.library,
-            tracklist_text=Path(a.tracklist).read_text(encoding="utf-8") if a.tracklist else None,
-            unordered=a.unordered, comments=a.comments, step=a.step, clip=a.clip, concurrency=a.concurrency,
-            min_confidence=a.min_confidence, include_estimated=not a.confirmed_only, fmt=a.format,
-            keep_full_mix=a.keep_full_mix, album=a.album, album_artist=a.album_artist)
+
+    analyze_args = dict(tracklist_text=Path(a.tracklist).read_text(encoding="utf-8") if a.tracklist else None,
+                        unordered=a.unordered, comments=a.comments, step=a.step, clip=a.clip,
+                        concurrency=a.concurrency, min_confidence=a.min_confidence)
+    if a.split_job:
+        if not a.library:
+            ap.error("--split-job needs --library (or MUSIC_LIBRARY)")
+        rows = json.loads(Path(a.rows).read_text(encoding="utf-8")) if a.rows else None
+        split(a.split_job, a.library, rows=rows, album=a.album, album_artist=a.album_artist,
+              fmt=a.format, keep_full_mix=a.keep_full_mix)
+    elif not a.source:
+        ap.error("give a YouTube URL or audio file")
+    elif a.analyze_only:
+        analyze(a.source, a.analyze_only, include_estimated=not a.confirmed_only, **analyze_args)
+    else:
+        process(a.source, out=a.out, library=a.library, include_estimated=not a.confirmed_only, fmt=a.format,
+                keep_full_mix=a.keep_full_mix, album=a.album, album_artist=a.album_artist, **analyze_args)
 
 
 if __name__ == "__main__":
